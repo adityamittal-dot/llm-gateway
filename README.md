@@ -1,61 +1,125 @@
 # LLM Gateway
 
-A self-built AWS-based gateway that routes, caches, and secures every LLM call an application makes — instead of hitting Bedrock/OpenAI directly. Built to demonstrate real distributed-systems infra skills (rate limiting, semantic caching, circuit breaking, multi-backend failover, cost/latency observability), not just "call an LLM API."
+A self-built, provider-agnostic gateway that routes, caches, secures and meters every LLM call an application makes — instead of apps hitting Bedrock, Anthropic or OpenAI directly. Apps keep using the OpenAI (or Anthropic) SDK they already have and only change `base_url`.
+
+Built to demonstrate real distributed-systems infra skills (token-aware rate limiting, semantic caching with measured correctness, circuit breaking, multi-provider failover, cost/latency observability), not just "call an LLM API". Positioned as **the gateway for agent workloads**: the place where runaway agent loops, model spend and cache correctness are controlled.
 
 ## Problem statement
 
 Every team adding an LLM feature eventually hits the same problems:
 
-- **Cost is invisible until it isn't.** No visibility into cost-per-request until the bill spikes.
+- **Cost is invisible until it isn't.** No visibility into cost-per-request, per-tenant or per-agent-run until the bill spikes.
 - **Vendor lock-in / outage risk.** A single provider dependency means a single point of failure.
-- **No caching for non-deterministic responses.** Exact-match caching doesn't work for natural language; most teams cache nothing and re-pay for near-identical prompts.
-- **No per-tenant rate limiting.** One noisy client can starve everyone else or blow the budget alone.
+- **No caching for non-deterministic responses.** Exact-match caching barely works for natural language; most teams cache nothing and re-pay for near-identical prompts.
+- **No per-tenant limits.** One noisy client — or one agent stuck in a loop — can starve everyone else or blow the budget alone.
 
-This project solves all four by building the gateway layer that should sit between any app and any LLM provider.
+This project solves these by building the gateway layer that should sit between any app and any LLM provider.
 
 ## Architecture
 
 ```
-Client
+Client (OpenAI / Anthropic SDK, base_url = gateway)
   |
   v
-API Gateway (HTTP API) + Cognito authorizer   <- auth, per-key rate limiting
+CloudFront (optional) -> ALB            <- TLS, long idle timeout for streaming
   |
   v
-ALB
+ECS Fargate (N tasks): Uvicorn -> FastAPI (async, SSE streaming)
   |
-  v
-ECS Fargate task
+  +-- Auth: API key (hashed) -> tenant / team / key
+  +-- Rate limit + budget check (Redis token bucket, token-aware)
+  +-- Cache: exact-match hash -> semantic (vector) lookup, tenant-scoped
+  |     +-- HIT  -> return cached response
+  |     +-- MISS -> Router
   |
-  +-- nginx (sidecar, public-facing)
+  +-- Router (fallback chains, cost/latency rules, complexity routing)
   |     |
-  |     v
-  +-- Uvicorn -> Django (ASGI, async views)
-        |
-        v
-      Redis semantic cache check (ElastiCache, RediSearch)
-        |
-        +-- HIT  -> return cached response
-        |
-        +-- MISS -> Circuit breaker
-                      |
-                      +-- Bedrock (primary: Claude Haiku/Sonnet)
-                      |
-                      +-- Fallback (secondary Bedrock model,
-                          stretch: self-hosted EC2 GPU model)
+  |     +-- Circuit breaker (state shared in Redis)
+  |           |
+  |           +-- BedrockAdapter        (Converse API: Claude, Llama, Mistral, Nova)
+  |           +-- AnthropicAdapter      (direct API)
+  |           +-- OpenAIAdapter / AzureOpenAIAdapter
+  |           +-- GeminiAdapter
+  |           +-- OpenAICompatAdapter   (vLLM, Ollama, Groq, Together...)
+  |
+  +-- Usage event -> SQS / Firehose -> S3 + Athena (off the hot path)
+
+State:  Redis       - rate limits, caches, breaker state
+        Postgres    - tenants, keys, budgets, routing config, price table, usage ledger
+Telemetry: OpenTelemetry (GenAI semantic conventions) -> X-Ray / CloudWatch, Sentry for errors
 ```
 
-Every hop is instrumented:
-- **X-Ray** traces the full chain (ALB -> Fargate -> Redis -> Bedrock)
-- **CloudWatch custom metrics** capture cost-per-token, cache hit rate, failover count
-- **Sentry** captures exceptions and custom circuit-breaker-trip events
+### Why not API Gateway in the hot path
 
-## What we're solving (the real engineering problems)
+API Gateway HTTP APIs cap integrations at 30s and buffer responses, which breaks token streaming and long completions. Auth and rate limiting live inside the gateway instead (as LiteLLM and Portkey do). Cognito is only used for the admin dashboard login.
 
-1. **LLM cost as the new cloud cost problem** — semantic caching gives a measurable, defensible cost reduction story ("cut redundant model calls by X%").
-2. **Vendor lock-in and outages** — multi-backend routing with circuit breaker logic means one provider's outage doesn't take the product down.
-3. **Rate limiting under multi-tenancy** — per-API-key sliding-window quotas via DynamoDB TTL counters.
-4. **Cache correctness for non-deterministic systems** — deciding what "close enough" means for two prompts to share a cached answer, and what happens when that's wrong.
+## Provider-agnostic by design
+
+Bedrock is one adapter, not the architecture. Every provider implements the same interface:
+
+```python
+class ProviderAdapter(Protocol):
+    async def complete(self, req: ChatRequest) -> ChatResponse: ...
+    def stream(self, req: ChatRequest) -> AsyncIterator[ChatChunk]: ...
+    def classify_error(self, exc: Exception) -> ErrorKind: ...  # rate_limited | overloaded | bad_request | auth | timeout
+```
+
+Adapters translate the unified request to the provider's format and back, normalise errors into one taxonomy (which drives retry/failover decisions) and report token usage for cost accounting.
+
+Public API surface:
+
+| Endpoint | Compatible with |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI SDKs (streaming + non-streaming, tools) |
+| `POST /v1/messages` | Anthropic SDKs |
+| `POST /v1/embeddings` | OpenAI SDKs |
+| `GET /v1/models` | Lists models the calling key may use |
+| `/admin/*` | Tenants, keys, budgets, routing rules, usage reports |
+
+## The real engineering problems
+
+### 1. Semantic cache correctness
+- **Tenant-scoped.** A shared cache can serve one customer's answer to another; that's a data leak, not a miss.
+- **Key = model + system prompt + params (temperature, tools) + full conversation**, not just the last user message.
+- **Two layers:** exact-match hash first (free, zero false positives), then embedding similarity.
+- **Opt-in per request** (`x-cache: semantic`); skipped by default for tool calls and high temperature.
+- **Measured:** a labelled set of prompt pairs (same intent / different intent) is used to tune the similarity threshold and report precision/recall in CI. The dashboard shows hit rate, estimated false-hit rate and dollars saved.
+- The embedding call adds latency on a miss; the net latency/cost effect is reported, not assumed.
+
+### 2. Failover and circuit breaking
+- Fail over on `429`, `5xx` and timeouts. **Never on `400`** — a bad request fails everywhere.
+- Breaker state lives in Redis and is shared by all Fargate tasks.
+- **Streams can only fail over before the first token.** A time-to-first-token deadline makes that fast.
+- Retries use exponential backoff with jitter and a per-request retry budget to prevent retry storms.
+
+### 3. Token-aware multi-tenant rate limiting
+- Requests-per-minute alone is meaningless when one request can be 100 or 100k tokens.
+- Token bucket in Redis (atomic Lua script): reserve an **estimated** token count up front, reconcile with actual usage (reported at the end of a stream).
+- Hierarchical limits and budgets: **org -> team -> key**, soft (alert) and hard (reject or downgrade) limits.
+
+### 4. Cost accounting
+- Versioned price table per model and region, with cached-token discounts handled separately.
+- Every request writes to a usage ledger, so per-tenant bills can be rebuilt from it.
+
+### 5. Gateway overhead
+- The gateway's own p50/p99 latency (excluding the provider, cache off) is measured with k6 and published in this README. It is the first number anyone evaluating a gateway asks for.
+
+## Differentiating features
+
+The basics (unified API, fallback, keys, logs) are table stakes — LiteLLM, Portkey, Kong, Cloudflare AI Gateway, Bifrost, OpenRouter and Helicone all do them. This project goes deep on agent workloads and cost:
+
+| Feature | What it does |
+|---|---|
+| **Agent cost controls** | Budgets per session / agent run (`x-session-id`), runaway-loop detection (repeated identical tool calls), auto-downgrade to a cheaper model near budget |
+| **Measured semantic cache** | Hit rate, estimated false-hit rate and dollars saved, backed by a labelled eval set |
+| **Complexity routing** | A small classifier sends easy prompts to a cheap model (Haiku) and hard ones to a strong one (Sonnet); quality checked with sampled LLM-as-judge |
+| **Shadow traffic / model A/B** | Mirror X% of traffic to a candidate model and compare cost, latency and quality |
+| **"What-if" cost replay** | "Last month on model Y would have cost $Z" from the usage ledger |
+| **Prompt-caching passthrough** | Supports Anthropic `cache_control` / Bedrock prompt caching and reports the savings |
+| **Guardrails** | PII redaction, prompt-injection detection, optional Bedrock Guardrails |
+| **Tool-call / MCP governance** | Allow-lists and audit log for the tools agents may call |
+| **Request hedging** | Fire a second request if the first is slow past p95; take whichever returns first |
+| **Batch routing** | Requests marked async go to provider batch APIs (~50% cheaper) |
 
 ## Tech stack
 
@@ -63,78 +127,118 @@ Every hop is instrumented:
 | Layer | Choice |
 |---|---|
 | Container runtime | ECS Fargate |
-| In-task reverse proxy | nginx (sidecar, proxies to Uvicorn over Unix socket) |
 | App server | Uvicorn (ASGI) |
-| Framework | Django (ASGI, async views) + Django REST Framework |
-| Load balancer | Application Load Balancer (ALB) |
-| API ingress / auth | API Gateway (HTTP API) + Cognito authorizer |
+| Framework | FastAPI (async, Pydantic v2 models, SSE streaming via `StreamingResponse`) |
+| HTTP client | `httpx` (async, connection pooling) |
+| Load balancer | Application Load Balancer (idle timeout raised for streaming), optional CloudFront in front |
+| Auth | API keys (hashed, per tenant/team) in-app; Cognito for the admin dashboard |
 
-### Caching
+### Caching & state
 | Layer | Choice |
 |---|---|
-| Cache store | ElastiCache for Redis (RediSearch for vector similarity) |
-| Redis client | `redis-py` async interface |
-| Embedding model | Amazon Titan Embeddings via Bedrock |
+| Rate limits, breaker state, exact cache | Redis (ElastiCache) |
+| Semantic cache | Redis vector search (ElastiCache Valkey/MemoryDB with vector search; Redis Stack locally) |
+| Redis client | `redis-py` asyncio |
+| Embedding model | Amazon Titan Embeddings via Bedrock (pluggable) |
+| Config & ledger | Postgres (RDS) via SQLAlchemy 2.0 async + Alembic migrations |
+| Analytics | SQS/Firehose -> S3 -> Athena |
 
 ### Model backends
 | Layer | Choice |
 |---|---|
-| Primary | Bedrock — Claude Haiku (dev) / Sonnet (demo) |
-| Fallback | Second Bedrock model (stretch: self-hosted EC2 GPU, demo-only) |
-| Bedrock client | `aioboto3` |
-
-### State & data
-| Layer | Choice |
-|---|---|
-| Request/rate-limit state | DynamoDB (TTL-based sliding window counters) |
-| ORM (optional) | Django ORM + Postgres, only if admin/migrations for request logs are wanted |
+| Bedrock | Converse / ConverseStream API via `aioboto3` (one format across Bedrock models, cross-region inference profiles) |
+| Others | Anthropic, OpenAI, Azure OpenAI, Gemini, any OpenAI-compatible server (vLLM, Ollama) |
+| Dev primary | Claude Haiku on Bedrock |
+| Fallback | Second Bedrock model or Anthropic direct (stretch: self-hosted vLLM, demo-only) |
 
 ### Observability
 | Layer | Choice |
 |---|---|
-| Metrics/dashboards | CloudWatch custom metrics + Dashboards |
-| Distributed tracing | AWS X-Ray |
-| Logs | CloudWatch Logs (structured JSON, Logs Insights) |
-| Error tracking | Sentry (Django/ASGI integration) |
-| Alerting | Sentry issue alerts + CloudWatch Alarms |
-
-### Infra as code
-| Layer | Choice |
-|---|---|
-| IaC | Terraform, modular (`networking`, `ecs-service`, `cache`, `api-gateway`, `observability`) |
-| State | Remote state in S3 + DynamoDB lock table |
+| Tracing & metrics | OpenTelemetry with GenAI semantic conventions -> X-Ray / CloudWatch (ADOT collector sidecar) |
+| Logs | Structured JSON to CloudWatch Logs (metadata by default; prompt logging opt-in with redaction and retention) |
+| Error tracking | Sentry (FastAPI integration), custom events for breaker trips |
+| Dashboards & alerts | CloudWatch Dashboards + Alarms, Sentry alerts |
 
 ### Local dev / testing
 | Layer | Choice |
 |---|---|
-| Local Redis | Docker Compose |
-| Load testing | k6 or Artillery (prove circuit breaker trips under failure) |
+| Local stack | Docker Compose: gateway + Redis Stack + Postgres + **mock LLM server** (no Bedrock spend in dev) |
+| Tests | pytest + pytest-asyncio, fake providers, contract tests per adapter |
+| Chaos | Toxiproxy to inject latency/errors and prove failover |
+| Load | k6 (gateway overhead, breaker behaviour under failure) |
+| Cache eval | Labelled prompt-pair set, precision/recall gate in CI |
+| Lint/type | ruff, mypy |
+| CI/CD | GitHub Actions: test -> build image -> push to ECR -> `terraform apply` -> ECS deploy |
+
+## Infrastructure as code (Terraform)
+
+All AWS infrastructure is Terraform; application code ships as a container image that Terraform references by tag.
+
+```
+infra/
+  bootstrap/            # one-time: S3 state bucket + DynamoDB lock table, GitHub OIDC role
+  modules/
+    networking/         # VPC, public/private subnets, NAT (or VPC endpoints), security groups
+    ecr/                # image repository + lifecycle policy
+    ecs-service/        # cluster, task definition (app + ADOT sidecar), service, autoscaling, IAM task role
+    alb/                # ALB, listeners, target group, ACM cert, idle timeout
+    cache/              # ElastiCache / MemoryDB, subnet group, parameter group
+    database/           # RDS Postgres, secrets in Secrets Manager
+    bedrock-access/     # IAM policies scoped to allowed model ARNs / inference profiles
+    secrets/            # Secrets Manager entries for provider API keys (values set out of band)
+    analytics/          # SQS/Firehose, S3 bucket, Glue table, Athena workgroup
+    observability/      # CloudWatch dashboards, alarms, log groups + retention, AWS Budgets alerts
+    auth/               # Cognito user pool for the admin dashboard
+  envs/
+    dev/                # small instances, scale-to-zero friendly
+    demo/
+```
+
+- **Remote state** in S3 with DynamoDB locking; one state per environment.
+- **GitHub Actions authenticates via OIDC** — no long-lived AWS keys in CI.
+- **Secret values never live in Terraform**; it creates the Secrets Manager entries, values are set out of band.
+- `terraform destroy` on `envs/dev` is the cost-control habit; AWS Budgets alerts are themselves Terraform-managed.
+- CI runs `terraform fmt -check`, `validate`, `tflint` and `plan` on PRs; `apply` only from `main`.
 
 ## Roadmap
 
-### MVP (week 1-2)
-- API Gateway with Cognito auth + basic per-key rate limiting
-- Single route straight to Bedrock, no cache/router yet
-- CloudWatch logging of latency and token counts
+Each phase ends with something demoable.
 
-### Core build (week 3-4)
-- Redis semantic cache (embed prompt, cosine-similarity lookup)
-- Circuit breaker around the Bedrock call (fail over after N consecutive failures)
-- Second backend for failover proof (start with a cheaper Bedrock model, not GPU EC2)
+### Phase 1 — Core path
+- FastAPI service with OpenAI-compatible `/v1/chat/completions`, Bedrock adapter (Converse), SSE streaming
+- API-key auth, structured logs, Docker Compose local stack with a mock LLM server
+- **Done when:** the OpenAI Python SDK works against the gateway with only `base_url` changed
 
-### Polish for resume/demo (week 5+)
-- Dashboard: cache hit rate over time, cost saved by caching, failover events triggered
-- Load test proving the circuit breaker trips under simulated failure
-- Terraform module set, with README arguing the design tradeoffs
-- Sentry wired to capture circuit-breaker-trip events as custom tagged messages
+### Phase 2 — Reliability
+- Error taxonomy, retries with jitter, Redis-shared circuit breaker
+- Second adapter (Anthropic direct or a fallback Bedrock model), fallback chains
+- **Done when:** a Toxiproxy-broken primary triggers automatic failover and the breaker opens
+
+### Phase 3 — Cost control
+- Token-bucket rate limits in Redis, hierarchical budgets, price table, usage ledger
+
+### Phase 4 — Caching
+- Exact-match then semantic cache, tenant-scoped, opt-in
+- Labelled eval set with published precision/recall
+
+### Phase 5 — Observability
+- OpenTelemetry traces/metrics, dashboard: cost, cache hit rate, $ saved, failovers, gateway overhead
+- k6 results published in this README
+
+### Phase 6 — Differentiators
+- Agent cost controls (session budgets, loop detection) first, then complexity routing and shadow traffic
+
+### Phase 7 — Infra & polish
+- Terraform modules and environments, GitHub Actions CI/CD with OIDC
+- Remaining adapters (OpenAI, Gemini, OpenAI-compatible), `/v1/messages` endpoint, admin API
 
 ## Cost notes
 
-- Avoid OpenSearch Serverless-style always-on minimums where possible.
-- SageMaker/self-hosted GPU inference is the biggest silent cost risk (~$380/month if left running on g4dn.xlarge) — keep the fallback backend as a second Bedrock model for the MVP, add GPU-hosted fallback only as a stretch goal spun up for demo recording, then torn down.
-- ECS Fargate + ALB + ElastiCache have no meaningful free tier — expect roughly $15-30/month if development habits (tear down when not active) are followed.
-- Set AWS Budgets alerts at $10 and $25 before provisioning anything.
+- Never run the dev environment against real Bedrock by default — use the mock LLM server; switch to Haiku only for integration tests and demos.
+- Self-hosted GPU inference is the biggest silent cost risk (~$380/month if a g4dn.xlarge is left running) — keep it a stretch goal, spun up for demo recording, then torn down.
+- ECS Fargate + ALB + ElastiCache + RDS have no meaningful free tier — expect roughly $30-60/month while running; tear down `envs/dev` when not active. NAT gateways are a hidden cost; prefer VPC endpoints in dev.
+- AWS Budgets alerts at $10 and $25 are provisioned before anything else.
 
 ## Request path (end to end)
 
-Client -> API Gateway (Cognito auth, rate limit) -> ALB -> ECS Fargate task -> nginx -> Uvicorn -> Django (ASGI) -> Redis semantic cache check -> hit: return cached response / miss: circuit breaker -> Bedrock primary or fallback -> response, with X-Ray tracing the full hop chain, CloudWatch capturing cost/latency metrics, and Sentry capturing exceptions and failover events.
+Client -> ALB -> Fargate (FastAPI) -> API-key auth -> token-aware rate limit and budget check (Redis) -> exact then semantic cache (Redis) -> hit: return cached response / miss: router -> circuit breaker -> provider adapter (Bedrock, Anthropic, OpenAI, ...) with fallback -> streamed response -> usage event to the ledger, with OpenTelemetry tracing every hop and Sentry capturing exceptions and failover events.
