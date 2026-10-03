@@ -76,6 +76,25 @@ Public API surface:
 | `GET /v1/models` | Lists models the calling key may use |
 | `/admin/*` | Tenants, keys, budgets, routing rules, usage reports |
 
+## Data model (Postgres)
+
+Postgres is the system of record; Redis only holds hot, rebuildable state (rate-limit counters, caches, breaker state).
+
+| Table | Purpose |
+|---|---|
+| `orgs`, `teams` | Tenant hierarchy |
+| `api_keys` | Hashed key, owner (org/team), allowed models, rate limits, status |
+| `budgets` | Soft/hard spend limits per org, team, key or session; period and reset rules |
+| `routing_rules` | Fallback chains, model aliases, complexity-routing and shadow-traffic config |
+| `model_prices` | Versioned price per model/region (input, output, cached tokens), effective-from date |
+| `usage_ledger` | One row per request: tenant, key, session, model, provider, tokens, cost, latency, cache status, failover flag. **Partitioned by month** so old data can be detached and archived to S3 cheaply |
+
+Design rules:
+- The ledger is append-only; budgets are checked against Redis counters on the hot path and reconciled from the ledger.
+- Writes to the ledger happen off the request path (background batch insert or via SQS), so a slow database never slows a completion.
+- Config reads (keys, routing rules, prices) are cached in-process with a short TTL and invalidated on admin changes.
+- `pgvector` is a possible alternative store for the semantic cache, but Redis is the default because cache lookups sit on the hot path.
+
 ## The real engineering problems
 
 ### 1. Semantic cache correctness
@@ -140,7 +159,9 @@ The basics (unified API, fallback, keys, logs) are table stakes — LiteLLM, Por
 | Semantic cache | Redis vector search (ElastiCache Valkey/MemoryDB with vector search; Redis Stack locally) |
 | Redis client | `redis-py` asyncio |
 | Embedding model | Amazon Titan Embeddings via Bedrock (pluggable) |
-| Config & ledger | Postgres (RDS) via SQLAlchemy 2.0 async + Alembic migrations |
+| Primary database | PostgreSQL 16+ on RDS — system of record for tenants, keys, budgets, routing config, price table and usage ledger |
+| DB access | SQLAlchemy 2.0 async on `asyncpg`, Alembic migrations |
+| Connection pooling | RDS Proxy (many Fargate tasks x pool size would otherwise exhaust Postgres connections) |
 | Analytics | SQS/Firehose -> S3 -> Athena |
 
 ### Model backends
@@ -176,14 +197,14 @@ All AWS infrastructure is Terraform; application code ships as a container image
 
 ```
 infra/
-  bootstrap/            # one-time: S3 state bucket + DynamoDB lock table, GitHub OIDC role
+  bootstrap/            # one-time: S3 state bucket (native S3 locking), GitHub OIDC role
   modules/
     networking/         # VPC, public/private subnets, NAT (or VPC endpoints), security groups
     ecr/                # image repository + lifecycle policy
     ecs-service/        # cluster, task definition (app + ADOT sidecar), service, autoscaling, IAM task role
     alb/                # ALB, listeners, target group, ACM cert, idle timeout
     cache/              # ElastiCache / MemoryDB, subnet group, parameter group
-    database/           # RDS Postgres, secrets in Secrets Manager
+    database/           # RDS Postgres, RDS Proxy, credentials in Secrets Manager
     bedrock-access/     # IAM policies scoped to allowed model ARNs / inference profiles
     secrets/            # Secrets Manager entries for provider API keys (values set out of band)
     analytics/          # SQS/Firehose, S3 bucket, Glue table, Athena workgroup
@@ -194,7 +215,7 @@ infra/
     demo/
 ```
 
-- **Remote state** in S3 with DynamoDB locking; one state per environment.
+- **Remote state** in S3 with native lockfile locking (`use_lockfile = true`; DynamoDB locking is deprecated); one state per environment.
 - **GitHub Actions authenticates via OIDC** — no long-lived AWS keys in CI.
 - **Secret values never live in Terraform**; it creates the Secrets Manager entries, values are set out of band.
 - `terraform destroy` on `envs/dev` is the cost-control habit; AWS Budgets alerts are themselves Terraform-managed.
