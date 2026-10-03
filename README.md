@@ -1,4 +1,4 @@
-# LLM Gateway / Inference Router
+# LLM Gateway
 
 A self-built AWS-based gateway that routes, caches, and secures every LLM call an application makes — instead of hitting Bedrock/OpenAI directly. Built to demonstrate real distributed-systems infra skills (rate limiting, semantic caching, circuit breaking, multi-backend failover, cost/latency observability), not just "call an LLM API."
 
