@@ -4,6 +4,10 @@ Working title: **"Silent Failures Return 200: Detecting and Attributing Provider
 
 This file holds the research topic, the plan, the research sprint, and the route to publication. The README describes the full gateway product. This file covers only the part that becomes a paper.
 
+> **Status (6 Oct 2026): sprint done, decision GO.** The detector and attribution experiments ran on
+> 12,000 recorded requests; read [results/memo.md](results/memo.md) for the decision and
+> [§10a](#10a-results-day-11) below for the summary. Next steps are in §11.
+
 ---
 
 ## 1. The idea in one paragraph
@@ -127,7 +131,7 @@ Generating responses is the expensive part, so each (provider, fault, severity, 
 
 This is valid here (unlike the agent-routing case in the Replay Gap) because each request is independent: the fault doesn't change which requests arrive next. Some live end-to-end runs confirm the replay results.
 
-## 10. The research sprint (days 1–11 of the 3-week plan)
+## 10. The research sprint (days 1–11 of the 3-week plan) — done
 
 The research work is part of the 3-week build plan in [PLAN.md](PLAN.md):
 
@@ -144,6 +148,33 @@ The research work is part of the 3-week build plan in [PLAN.md](PLAN.md):
 - **Go** if at least 3 fault types are detected well before 1,000 requests at under 1 false alarm per 10k healthy requests, **and** the attribution test beats per-tenant monitoring. Then continue with section 11.
 - **Partial** if detection works but attribution doesn't. A detection-only paper is still a workshop paper; attribution becomes future work.
 - **No-go** if signals don't separate faulty from healthy traffic. Ship the breaker and cache-break diagnosis as product features, and drop the paper track.
+
+## 10a. Results (day 11)
+
+Full tables: [results/summary.md](results/summary.md); figures: `results/figures/`; data card: [results/datacard.md](results/datacard.md).
+
+- **RQ1 (detection) — H1 met.** The pooled conformal e-detector at its theoretical threshold
+  (c = 10,000) raised **zero false alarms in 600,000 held-out healthy requests** and detected every
+  quality fault at full severity (median delay: quant swap 6, output cap 20, dropped system prompt 25,
+  truncation 32, model substitution 103, sampling 210 requests). At 30% severity: quant swap 45, output
+  cap 315, system prompt 534. 10%-severity faults are mostly missed within 3,000 requests.
+- **Baselines.** CUSUM and fixed thresholds, calibrated to the same target on reference prompts,
+  realised ARL₀ ≈ 4,200–4,500 on unseen prompts (2.2–2.4× the false-alarm budget). The HTTP-error
+  breaker detected nothing.
+- **RQ2 (attribution) — H2 met only after a design change.** Output-only cross-provider attribution
+  blamed the provider in 99% of pure traffic shifts because the shift was provider-specific. Adding
+  an input-side shift detector (client prompt size, content-free) cut false blame to 0%; 0.89 of
+  decisions correct vs 0.72 for per-tenant monitoring.
+- **RQ4 (signals).** Output length + finish reason carry most of the signal; tool-call validity and
+  repetition expose the quantization swap; latency is load-confounded and kept separate.
+- **Not supported.** Pooling across tenants did not speed up detection for faults concentrated in
+  some tenants. **RQ3 (active probing) not yet tested.**
+- **Related negative result.** A fixed-threshold semantic cache fails on adversarial PAWS pairs (98%
+  false hits; [results/cache_eval.md](results/cache_eval.md)).
+
+**Open items before writing the paper:** input-side shift detection in the online breaker
+(`quality.py`), a combined pooled + per-tenant alarm, the Bedrock replication of faults 1–5 (needs AWS
+credentials), the active-probing baseline at equal dollar cost, and a literature re-check.
 
 ## 11. After the sprint (if "go"): roughly 8–10 more weeks to submission
 

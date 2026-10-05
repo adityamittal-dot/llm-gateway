@@ -2,20 +2,80 @@
 
 A self-built, provider-agnostic gateway that routes, caches, secures and meters every LLM call an application makes — instead of apps hitting Bedrock, Anthropic or OpenAI directly. Apps keep using the OpenAI (or Anthropic) SDK they already have and only change `base_url`.
 
-> **Status:** building, on a 3-week plan ([PLAN.md](PLAN.md)). Done so far: OpenAI-compatible passthrough gateway with streaming (day 1). Most of this README is still the design.
+Built to demonstrate real distributed-systems infra skills (token-aware rate limiting, semantic caching with measured correctness, circuit breaking, multi-provider failover, cost/latency observability), not just "call an LLM API". The headline feature is a **quality circuit breaker**: the gateway notices when a provider starts returning worse answers with `200 OK`, works out whether the provider or the traffic changed, and fails over with a bounded false-alarm rate.
 
-## Quickstart (current state)
+> **Status (6 Oct 2026):** days 1–17 of the [3-week plan](PLAN.md) are built, reviewed and merged
+> (94 tests). The research go/no-go is **GO** ([results/memo.md](results/memo.md)). Not started yet:
+> days 18–21 (Terraform, CI/CD, AWS deploy, final polish). See [What's left](#whats-left).
+> Sections from "Architecture" down describe the target design; the table below says what exists today.
+
+## What works today
+
+| Area | Implemented | Where |
+|---|---|---|
+| API | OpenAI-compatible `POST /v1/chat/completions` (streaming + non-streaming, tools), `GET /v1/models` | `app.py` |
+| Providers | OpenAI-compatible (Ollama, vLLM, Groq, Gemini, OpenAI), Amazon Bedrock Converse (text, tools, images as data URLs) | `providers/` |
+| Auth | API keys stored as SHA-256 hashes, tenant per key, `require_auth` | `config.py` |
+| Reliability | Error taxonomy, retries with full jitter + retry budget, Redis-shared circuit breaker (half-open probe), fallback chains (`routes:`) | `retries.py`, `breaker.py` |
+| Cost control | Token-aware rate limits (Redis Lua token buckets, key → team → org), monthly budgets, price table, per-request cost | `ratelimit.py`, `pricing.py` |
+| System of record | Postgres schema + Alembic, usage ledger partitioned by month, batched off-path writes, DB prices | `db.py`, `migrations/` |
+| Caching | Exact + semantic cache, tenant-scoped, opt-in (`x-cache`), SSE replay of hits | `cache.py` |
+| Observability | OpenTelemetry metrics at `/metrics`, GenAI-convention traces (OTLP), Grafana dashboard, k6 overhead benchmark | `telemetry.py`, `observability/`, `loadtest/` |
+| **Quality circuit breaker** | Passive quality signals per response, online conformal e-detector per provider, graded actions (alert → shift → open + canary), recovery | `signals.py`, `quality.py` |
+| Agent controls | Session budgets, iteration caps and tool-call loop detection (`X-Session-Id`); cache-break diagnosis | `sessions.py`, `promptcache.py` |
+| Research harness | Fault injector (7 faults), tenant workloads, recorder, detectors, attribution, ablation, report | `faults.py`, `research/` |
+| Local stack | Mock LLM, Docker Compose (gateway, mock, Redis Stack, Postgres, Prometheus, Grafana), no-Docker dev stack | `mock_llm.py`, `docker-compose.yml`, `scripts/dev_stack.sh` |
+
+## Key results
+
+- **Quality breaker (research, [memo](results/memo.md)):** zero false alarms in 600,000 healthy test
+  requests at the theoretical threshold; every injected quality fault detected at full severity (a
+  quantization swap within 6 requests); tuned CUSUM/threshold baselines exceeded the false-alarm budget
+  2.2–2.4× on unseen prompts; the HTTP-error breaker caught nothing. Provider-vs-traffic attribution
+  needs input-side evidence: 0% false blame under traffic shifts once added (0.89 correct overall).
+- **Failover demo:** Toxiproxy breaks the primary → backup serves every request, breaker opens, half-open probe closes it ([results/failover_demo.txt](results/failover_demo.txt)).
+- **Quality-breaker demo:** a silent fault (HTTP 200, truncated answers) moves traffic to the backup and recovers via canaries; the HTTP breaker never moves ([results/quality_breaker_demo.txt](results/quality_breaker_demo.txt)).
+- **Gateway overhead (k6):** 1.3 ms p50 / 2.1 ms p99 per request unloaded; one worker saturates near 500 req/s ([§5](#5-gateway-overhead)).
+- **Semantic cache:** unsafe with a fixed threshold on adversarial near-duplicates (98% false hits on PAWS) — stays opt-in ([results/cache_eval.md](results/cache_eval.md)).
+
+## Quickstart
 
 ```bash
-# Upstream: a local Ollama server (default http://localhost:11434/v1; override with UPSTREAM_BASE_URL)
-ollama pull qwen2.5:1.5b-instruct-q8_0
 uv sync
-uv run llm-gateway                 # serves http://127.0.0.1:8000
-uv run python scripts/smoke.py     # stock OpenAI SDK, only base_url changed
-uv run pytest                      # tests use a fake upstream; no Ollama needed
+uv run pytest                                  # 94 tests; Redis/Postgres tests use a local valkey-server / embedded Postgres
+
+# Local stack without Docker: Valkey + embedded Postgres + mock LLM + gateway (key sk-dev-local, model mock-small)
+scripts/dev_stack.sh
+# With Docker: docker compose up --build   (adds Prometheus :9090 and Grafana :3000)
+
+# Demos (no GPU needed)
+uv run python scripts/failover_demo.py         # needs toxiproxy-server on PATH
+uv run python scripts/quality_breaker_demo.py
+uv run python scripts/overhead.py              # needs k6 on PATH
+
+# Real local models: Ollama on http://localhost:11434
+ollama pull qwen2.5:1.5b-instruct-q8_0
+uv run llm-gateway                             # http://127.0.0.1:8000, config via GATEWAY_CONFIG (see config/gateway.example.yaml)
+uv run python scripts/smoke.py                 # stock OpenAI SDK, only base_url changed
 ```
 
-Built to demonstrate real distributed-systems infra skills (token-aware rate limiting, semantic caching with measured correctness, circuit breaking, multi-provider failover, cost/latency observability), not just "call an LLM API". The headline feature is a **quality circuit breaker**: the gateway notices when a provider starts returning worse answers with `200 OK`, works out whether the provider or the traffic changed, and fails over with a bounded false-alarm rate.
+Research pipeline: `scripts/get_datasets.sh` → `python -m llm_gateway.research.record` (≈3.5 h on a GTX 1650)
+→ `python -m llm_gateway.research.experiments {baselines,detectors,attribution,ablation}` → `python -m llm_gateway.research.report`.
+
+## What's left
+
+| Item | Status |
+|---|---|
+| Day 18–19: Terraform (networking, ECR, ECS, ALB, ElastiCache, RDS, IAM) + GitHub Actions CI/CD with OIDC | not started |
+| Day 20: deploy the demo to AWS on credits, then `terraform destroy` | not started; needs your AWS credentials |
+| Day 21: README results polish, architecture diagram | not started |
+| Port input-side shift detection into the online breaker (`quality.py` uses output signals only) | open — the memo shows it is required for correct attribution |
+| Combined pooled + per-tenant detector; Bedrock replication of faults 1–5; active-probing baseline | research follow-ups |
+| Deferred from the 3-week scope | `/v1/messages`, `/v1/embeddings`, Anthropic/Azure/Gemini-native adapters, admin UI + Cognito, SQS/Athena analytics, RDS Proxy, shadow traffic, guardrails, MCP governance |
+
+**Needs you:** `aws configure` → `scripts/aws_budget_alerts.sh <email>` (confirm the subscription emails);
+Bedrock model access for Amazon Nova; optional `GROQ_API_KEY` / `GEMINI_API_KEY`; optional Docker
+access (`sudo usermod -aG docker $USER`).
 
 ## Problem statement
 
@@ -131,6 +191,7 @@ Design rules:
 - **Two layers:** exact-match hash first (free, zero false positives), then embedding similarity.
 - **Opt-in per request** (`x-cache: semantic`); skipped by default for tool calls and high temperature.
 - **Measured:** a labelled set of prompt pairs (same intent / different intent) is used to tune the similarity threshold and report precision/recall in CI. The dashboard shows hit rate, estimated false-hit rate and dollars saved.
+- **Result so far:** on 100 adversarial PAWS pairs no fixed threshold reaches 95% precision (98% false hits at 0.92) — see [results/cache_eval.md](results/cache_eval.md). Implemented with brute-force cosine over capped buckets in plain Redis rather than a vector index.
 - The embedding call adds latency on a miss; the net latency/cost effect is reported, not assumed.
 
 ### 2. Failover and circuit breaking
@@ -224,8 +285,6 @@ The quality circuit breaker is designed so it can also be written up as a paper.
 
 ## Tech stack
 
-## Tech stack
-
 ### Compute & routing
 | Layer | Choice |
 |---|---|
@@ -309,40 +368,42 @@ infra/
 
 Each phase ends with something demoable.
 
-### Phase 0 — Research sprint (days 1–11, current)
+Status legend: ✅ done · 🟡 partly done · ⬜ not started. Details per day in [PLAN.md](PLAN.md).
+
+### Phase 0 — Research sprint (days 1–11) ✅
 - Local-only: a minimal proxy, per-response quality signals, a fault proxy, and detectors. Uses local Ollama models, Amazon Bedrock on AWS credits, and free-tier APIs; no always-on AWS infrastructure.
 - **Done when:** the day-11 go/no-go memo exists. Research details and publishing route: [RESEARCH.md](RESEARCH.md)
 - **All phases run on a 3-week schedule (5–25 Oct 2026), each at MVP depth:** see [PLAN.md](PLAN.md) for the day-by-day plan and what is deferred.
 
-### Phase 1 — Core path
+### Phase 1 — Core path ✅
 - FastAPI service with OpenAI-compatible `/v1/chat/completions`, Bedrock adapter (Converse), SSE streaming
 - API-key auth, structured logs, Docker Compose local stack with a mock LLM server
 - **Done when:** the OpenAI Python SDK works against the gateway with only `base_url` changed
 
-### Phase 2 — Reliability
+### Phase 2 — Reliability ✅
 - Error taxonomy, retries with jitter, Redis-shared circuit breaker
 - Second adapter (Anthropic direct or a fallback Bedrock model), fallback chains
 - **Done when:** a Toxiproxy-broken primary triggers automatic failover and the breaker opens
 
-### Phase 3 — Cost control
+### Phase 3 — Cost control ✅
 - Token-bucket rate limits in Redis, hierarchical budgets, price table, usage ledger
 
-### Phase 4 — Caching
+### Phase 4 — Caching ✅ (eval published; result: fixed thresholds unsafe on adversarial pairs)
 - Exact-match then semantic cache, tenant-scoped, opt-in
 - Labelled eval set with published precision/recall
 
-### Phase 5 — Observability
+### Phase 5 — Observability ✅
 - OpenTelemetry traces/metrics, dashboard: cost, cache hit rate, $ saved, failovers, gateway overhead
 - k6 results published in this README
 
-### Phase 6 — Quality circuit breaker and research
+### Phase 6 — Quality circuit breaker and research 🟡 (breaker live; input-side attribution not yet online; shadow traffic deferred; paper not started)
 - Per-response quality signals recorded in the ledger (from Phase 3 onward, so baselines exist early)
 - Sequential detectors per (provider, model, region), cross-tenant attribution test, graded breaker actions
 - vLLM fault-injection harness and evaluation; paper draft
 - Cache-break diagnosis, agent session budgets and loop detection, shadow traffic
 - **Done when:** an injected quantization swap on one provider is detected and failed over within a published detection delay, at the configured false-alarm rate, while a simultaneous tenant traffic shift is *not* blamed on the provider
 
-### Phase 7 — Infra & polish
+### Phase 7 — Infra & polish ⬜
 - Terraform modules and environments, GitHub Actions CI/CD with OIDC
 - Remaining adapters (OpenAI, Gemini, OpenAI-compatible), `/v1/messages` endpoint, admin API
 
@@ -353,7 +414,7 @@ Each phase ends with something demoable.
 - Never run the dev environment against real Bedrock by default — use the mock LLM server; switch to Haiku only for integration tests and demos.
 - Self-hosted GPU inference is the biggest silent cost risk (~$380/month if a g4dn.xlarge is left running) — keep it a stretch goal, spun up for demo recording, then torn down.
 - ECS Fargate + ALB + ElastiCache + RDS have no meaningful free tier — expect roughly $30-60/month while running; tear down `envs/dev` when not active. NAT gateways are a hidden cost; prefer VPC endpoints in dev.
-- AWS Budgets alerts at $10 and $25 are provisioned before anything else.
+- AWS Budgets alerts at every $5 of spend (credits excluded) are provisioned before anything else: `scripts/aws_budget_alerts.sh`.
 
 ## Request path (end to end)
 
