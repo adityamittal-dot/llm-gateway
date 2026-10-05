@@ -219,6 +219,17 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
+        request.state.spans = []
+        try:
+            return await handle_chat(request)
+        except BaseException as exc:  # end any span left open by an unexpected error (e.g. Redis down)
+            for open_span in request.state.spans:
+                if open_span.is_recording():
+                    open_span.record_exception(exc)
+                    open_span.end()
+            raise
+
+    async def handle_chat(request: Request) -> Response:
         token = bearer_token(request)
         tenant = tenants.get(hash_key(token)) if token else None
         if tenant is None and settings.require_auth:
@@ -270,6 +281,7 @@ def create_app(
         span = tracer.start_span(f"chat {model}", attributes={
             "gen_ai.operation.name": "chat", "gen_ai.request.model": model, "llm_gateway.tenant": tenant,
             "llm_gateway.request_id": request_id, "llm_gateway.stream": bool(body.get("stream"))})  # fmt: skip
+        request.state.spans.append(span)
         common = {
             "request_id": request_id,
             "tenant": tenant,
