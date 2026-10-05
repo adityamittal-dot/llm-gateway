@@ -18,6 +18,8 @@ import numpy as np
 import pandas as pd
 
 from llm_gateway.research import harness as H
+from llm_gateway.research.edetector import EDetector, conformal_pvalues
+from llm_gateway.research.features import QUALITY
 
 RESULTS = Path("results")
 PROVIDER, HEALTHY, HEALTHY_TEST = "ollama-qwen", "qwen_healthy", "qwen_healthy_2"
@@ -76,7 +78,7 @@ def evaluate(table: H.Table, detectors: dict, args) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def baselines(table: H.Table, args) -> pd.DataFrame:
+def baselines(df: pd.DataFrame, table: H.Table, args) -> pd.DataFrame:
     detectors = {
         # name: (path function, calibration bracket lo, hi, fixed threshold or None)
         "http_breaker": (H.http_path, 0, 1, 0.2),
@@ -86,7 +88,22 @@ def baselines(table: H.Table, args) -> pd.DataFrame:
     return evaluate(table, detectors, args)
 
 
-EXPERIMENTS = {"baselines": baselines}
+def detectors(df: pd.DataFrame, table: H.Table, args) -> pd.DataFrame:
+    """Day 9: the conformal e-detector, pooled across tenants vs one detector per tenant."""
+    p = conformal_pvalues(table, QUALITY, HEALTHY)
+    log_c = float(np.log(TARGET_ARL))
+    dets = {
+        # Threshold from theory (ARL0 >= c), no tuning on healthy data.
+        "e_pooled": (EDetector(p, pooled=True), 0, 60, log_c),
+        "e_per_tenant": (EDetector(p, pooled=False), 0, 60, log_c),
+        # Same statistic with an empirically calibrated threshold, for a like-for-like comparison.
+        "e_pooled_calibrated": (EDetector(p, pooled=True), 0.0, 60.0, None),
+        "cusum": (H.cusum_path, 0.0, 500.0, None),
+    }
+    return evaluate(table, dets, args)
+
+
+EXPERIMENTS = {"baselines": baselines, "detectors": detectors}
 
 
 def main() -> None:
@@ -103,7 +120,7 @@ def main() -> None:
     df = H.load(args.recordings)
     table, _ = H.build_table(df, PROVIDER, HEALTHY)
     print(f"{len(table.rows):,} rows for {PROVIDER}; conditions: {sorted(set(table.rows.condition))}")
-    out = EXPERIMENTS[args.experiment](table, args)
+    out = EXPERIMENTS[args.experiment](df, table, args)
     RESULTS.mkdir(exist_ok=True)
     out.to_csv(RESULTS / f"{args.experiment}.csv", index=False)
     (RESULTS / f"{args.experiment}.json").write_text(json.dumps(vars(args), indent=2))
