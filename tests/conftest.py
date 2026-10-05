@@ -40,3 +40,20 @@ def valkey_url(tmp_path_factory):
     yield f"redis://127.0.0.1:{port}/0"
     proc.terminate()
     proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
+def postgres_url(tmp_path_factory):
+    """A real Postgres (embedded via pgserver) migrated to head; yields a postgresql+asyncpg URL."""
+    pgserver = pytest.importorskip("pgserver")
+    from alembic import command
+    from alembic.config import Config
+
+    server = pgserver.get_server(tmp_path_factory.mktemp("pg"), cleanup_mode="stop")
+    server.psql("CREATE DATABASE gateway_test;")
+    uri = server.get_uri("gateway_test").replace("postgresql://", "postgresql+asyncpg://", 1)
+    cfg = Config("alembic.ini")
+    cfg.attributes["url"] = uri
+    command.upgrade(cfg, "head")
+    yield uri
+    server.cleanup()

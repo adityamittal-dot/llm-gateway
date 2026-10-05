@@ -67,6 +67,8 @@ class Settings:
     orgs: dict = field(default_factory=dict)
     # USD per million tokens: {model: {input_per_mtok, output_per_mtok, cached_input_per_mtok}}.
     prices: dict = field(default_factory=dict)
+    # Postgres (postgresql+asyncpg://...): usage ledger and versioned prices. Optional.
+    database_url: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -94,6 +96,7 @@ class Settings:
             teams=dict(file_cfg.get("teams") or {}),
             orgs=dict(file_cfg.get("orgs") or {}),
             prices=dict(file_cfg.get("prices") or {}),
+            database_url=os.environ.get("DATABASE_URL") or file_cfg.get("database_url"),
         )
 
     def provider_configs(self) -> list[dict]:
