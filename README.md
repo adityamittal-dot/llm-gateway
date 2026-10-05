@@ -290,6 +290,11 @@ infra/
 
 Each phase ends with something demoable.
 
+### Phase 0 — Research sprint (2 weeks, current)
+- Local-only: a minimal proxy, per-response quality signals, a fault proxy, and detectors. Uses local Ollama models, Amazon Bedrock on AWS credits, and free-tier APIs; no always-on AWS infrastructure.
+- **Done when:** the day-14 go/no-go memo exists. Full plan, sprint schedule and publishing route: [RESEARCH.md](RESEARCH.md)
+- Phases 1–7 below proceed after a "go", reusing the sprint's proxy as Phase 1's starting point.
+
 ### Phase 1 — Core path
 - FastAPI service with OpenAI-compatible `/v1/chat/completions`, Bedrock adapter (Converse), SSE streaming
 - API-key auth, structured logs, Docker Compose local stack with a mock LLM server
@@ -323,6 +328,8 @@ Each phase ends with something demoable.
 - Remaining adapters (OpenAI, Gemini, OpenAI-compatible), `/v1/messages` endpoint, admin API
 
 ## Cost notes
+
+- Until Phase 0 shows a solid result, spending is limited to AWS credits, Claude and free-tier models (see [RESEARCH.md §9](RESEARCH.md#9-constraints-and-resources-phase-0-before-anything-solid)).
 
 - Never run the dev environment against real Bedrock by default — use the mock LLM server; switch to Haiku only for integration tests and demos.
 - Self-hosted GPU inference is the biggest silent cost risk (~$380/month if a g4dn.xlarge is left running) — keep it a stretch goal, spun up for demo recording, then torn down.
