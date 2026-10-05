@@ -234,6 +234,12 @@ def replay_as_chunks(response: dict) -> list[dict]:
         piece = word + (" " if i < len(words) - 1 else "")
         if piece:
             chunks.append(base | {"choices": [{"index": 0, "delta": {"content": piece}}]})
+    tool_calls = choice["message"].get("tool_calls") or []
+    if tool_calls:  # one delta carrying every call, in the streaming shape (with an index each)
+        deltas = [
+            {"index": i, **{k: v for k, v in c.items() if k != "index"}} for i, c in enumerate(tool_calls)
+        ]
+        chunks.append(base | {"choices": [{"index": 0, "delta": {"tool_calls": deltas}}]})
     chunks.append(
         base | {"choices": [{"index": 0, "delta": {}, "finish_reason": choice.get("finish_reason")}]}
     )
