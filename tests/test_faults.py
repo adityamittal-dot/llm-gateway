@@ -94,3 +94,12 @@ def test_admin_endpoints_are_disabled_without_admin_key():
     upstream = httpx.AsyncClient(base_url="http://u/v1", transport=httpx.MockTransport(handler))
     with TestClient(create_app(Settings(), client=upstream)) as gw:
         assert gw.get("/admin/faults").status_code == 404
+
+
+def test_truncation_costs_non_string_content():
+    image = {
+        "role": "user",
+        "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 400}}],
+    }
+    out = truncate_messages([image, {"role": "user", "content": "short"}], max_tokens=10)
+    assert out == [{"role": "user", "content": "short"}]
