@@ -29,3 +29,20 @@ def test_metrics_and_genai_spans():
     root, attempt = spans["chat m"], spans["provider fake"]
     assert attempt.parent.span_id == root.context.span_id
     assert root.attributes["gen_ai.system"] == "fake" and root.attributes["gen_ai.usage.output_tokens"] == 5
+
+
+def test_root_span_ends_when_the_handler_crashes():
+    from opentelemetry.sdk.trace import TracerProvider  # noqa: F401  (global provider set up above)
+
+    exporter = InMemorySpanExporter()
+    trace.get_tracer_provider().add_span_processor(SimpleSpanProcessor(exporter))
+
+    class Exploding(FakeProvider):
+        async def complete(self, body):
+            raise RuntimeError("boom")
+
+    app = create_app(Settings(), providers=[Exploding("x", models=["m"])])
+    with TestClient(app, raise_server_exceptions=False) as gw:
+        assert gw.post("/v1/chat/completions", json={"model": "m", "messages": []}).status_code == 500
+    span = next(s for s in exporter.get_finished_spans() if s.name == "chat m")
+    assert span.events[0].name == "exception"
