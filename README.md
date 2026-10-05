@@ -2,7 +2,9 @@
 
 A self-built, provider-agnostic gateway that routes, caches, secures and meters every LLM call an application makes — instead of apps hitting Bedrock, Anthropic or OpenAI directly. Apps keep using the OpenAI (or Anthropic) SDK they already have and only change `base_url`.
 
-Built to demonstrate real distributed-systems infra skills (token-aware rate limiting, semantic caching with measured correctness, circuit breaking, multi-provider failover, cost/latency observability), not just "call an LLM API". Positioned as **the gateway for agent workloads**: the place where runaway agent loops, model spend and cache correctness are controlled.
+> **Status:** design phase — this README is the plan; Phase 1 has not started.
+
+Built to demonstrate real distributed-systems infra skills (token-aware rate limiting, semantic caching with measured correctness, circuit breaking, multi-provider failover, cost/latency observability), not just "call an LLM API". The headline feature is a **quality circuit breaker**: the gateway notices when a provider starts returning worse answers with `200 OK`, works out whether the provider or the traffic changed, and fails over with a bounded false-alarm rate.
 
 ## Problem statement
 
@@ -13,7 +15,23 @@ Every team adding an LLM feature eventually hits the same problems:
 - **No caching for non-deterministic responses.** Exact-match caching barely works for natural language; most teams cache nothing and re-pay for near-identical prompts.
 - **No per-tenant limits.** One noisy client — or one agent stuck in a loop — can starve everyone else or blow the budget alone.
 
+- **Silent degradation.** Providers ship quantization, kernel, routing and sampling changes without a version bump. Responses still return `200 OK`, so uptime checks and HTTP-error circuit breakers see nothing while answer quality, tool-call validity or refusal rates move.
+
 This project solves these by building the gateway layer that should sit between any app and any LLM provider.
+
+## Positioning
+
+This is a crowded category, and most of the obvious features already exist:
+
+| Already shipped by others | Where |
+|---|---|
+| Unified OpenAI-compatible API, fallbacks, virtual keys, spend logs | LiteLLM, Portkey, Bifrost, Kong, Envoy AI Gateway, Cloudflare/Vercel AI Gateway, OpenRouter, Helicone |
+| Per-session agent budgets and iteration caps | LiteLLM (`max_budget_per_session`), agentgateway (hierarchical budgets with reserve-then-settle) |
+| Semantic caching | Portkey, Bifrost, Kong, Zuplo, TrueFoundry; with error guarantees in research (vCache) |
+| Auto-injected prompt-cache breakpoints | LiteLLM, Bifrost |
+| Complexity / cost routing | Not Diamond, Martian, several gateways |
+
+So this gateway does not compete on breadth. It covers those basics well enough to be usable and puts its depth into one thing none of them do. Their circuit breakers trip on `429`/`5xx`/timeouts. This one also trips on **statistical evidence that a provider's output quality changed**, measured passively from production traffic. Because it sees many tenants and many providers, it can tell *"the provider changed"* apart from *"your traffic changed"*. A single app's own monitoring cannot separate the two.
 
 ## Architecture
 
@@ -34,7 +52,7 @@ ECS Fargate (N tasks): Uvicorn -> FastAPI (async, SSE streaming)
   |
   +-- Router (fallback chains, cost/latency rules, complexity routing)
   |     |
-  |     +-- Circuit breaker (state shared in Redis)
+  |     +-- Circuit breaker (HTTP errors + quality signals, state shared in Redis)
   |           |
   |           +-- BedrockAdapter        (Converse API: Claude, Llama, Mistral, Nova)
   |           +-- AnthropicAdapter      (direct API)
@@ -123,22 +141,70 @@ Design rules:
 ### 5. Gateway overhead
 - The gateway's own p50/p99 latency (excluding the provider, cache off) is measured with k6 and published in this README. It is the first number anyone evaluating a gateway asks for.
 
+### 6. Quality circuit breaker (the differentiator)
+- **Passive signals only, no extra model calls.** Every response already carries cheap quality proxies:
+  - tool-call JSON/schema validity
+  - `finish_reason` mix (length cut-offs, content filters)
+  - refusal and empty-response rate
+  - output-length distribution
+  - client regenerate/retry rate (same session, same prompt prefix)
+  - agent loop rate
+  - TTFT and tokens/sec fingerprint
+  - prompt-cache read ratio
+- **Per (provider, model, region) stream**, so a degraded Bedrock region doesn't condemn the same model on Anthropic direct.
+- **Attribution: "provider changed" vs "traffic changed".**
+  - If one tenant's metrics move on every provider, its traffic changed.
+  - If many tenants' metrics move on one provider at once, the provider changed.
+  - This is a difference-in-differences test across tenants and providers. A single-app monitor cannot run it.
+- **Anytime-valid sequential tests** (e-processes / CUSUM) so the dashboard can be checked continuously without inflating false alarms. The false-failover rate is a configured bound, not a hope.
+- **Actions are graded:** alert → shift a share of traffic to the fallback → full open. Recovery is probed with a small canary share.
+- **Privacy:** only aggregate per-response metadata is pooled across tenants, never prompt or response content.
+
 ## Differentiating features
 
-The basics (unified API, fallback, keys, logs) are table stakes — LiteLLM, Portkey, Kong, Cloudflare AI Gateway, Bifrost, OpenRouter and Helicone all do them. This project goes deep on agent workloads and cost:
+The basics (unified API, fallback, keys, logs, session budgets) are table stakes (see [Positioning](#positioning)). They are built here because the gateway needs them, not because they are new.
 
-| Feature | What it does |
-|---|---|
-| **Agent cost controls** | Budgets per session / agent run (`x-session-id`), runaway-loop detection (repeated identical tool calls), auto-downgrade to a cheaper model near budget |
-| **Measured semantic cache** | Hit rate, estimated false-hit rate and dollars saved, backed by a labelled eval set |
-| **Complexity routing** | A small classifier sends easy prompts to a cheap model (Haiku) and hard ones to a strong one (Sonnet); quality checked with sampled LLM-as-judge |
-| **Shadow traffic / model A/B** | Mirror X% of traffic to a candidate model and compare cost, latency and quality |
-| **"What-if" cost replay** | "Last month on model Y would have cost $Z" from the usage ledger |
-| **Prompt-caching passthrough** | Supports Anthropic `cache_control` / Bedrock prompt caching and reports the savings |
-| **Guardrails** | PII redaction, prompt-injection detection, optional Bedrock Guardrails |
-| **Tool-call / MCP governance** | Allow-lists and audit log for the tools agents may call |
-| **Request hedging** | Fire a second request if the first is slow past p95; take whichever returns first |
-| **Batch routing** | Requests marked async go to provider batch APIs (~50% cheaper) |
+| Feature | What it does | New? |
+|---|---|---|
+| **Quality circuit breaker** | Detects silent provider degradation from passive traffic signals, attributes it to provider vs traffic, fails over with a bounded false-alarm rate | **Yes:** the research track below |
+| **Cache-break diagnosis** | Hashes each prompt block; when a key's prompt-cache read ratio drops, names the block that changed (timestamp in the system prompt, reordered tools, a new tool) and the deploy that introduced it | Mostly new; gateways report hit rate but not *why* it fell |
+| **Measured semantic cache** | Hit rate, estimated false-hit rate and dollars saved, backed by a labelled eval set | Partly; error-bounded caching exists in research |
+| **Agent cost controls** | Budgets per session (`x-session-id`), loop detection from repeated tool calls, auto-downgrade near budget | No (LiteLLM, agentgateway); built as table stakes |
+| **Prompt-caching passthrough** | Anthropic `cache_control`, Bedrock `cachePoint`, OpenAI breakpoints; reports savings | No |
+| **Shadow traffic / model A/B** | Mirror X% of traffic to a candidate model and compare cost, latency and quality | No |
+| **Cost repricing** | "Last month's tokens at model Y's prices": an estimate for single-turn traffic only. It is *not* valid for agents: a different model takes different steps (see "The Replay Gap", arXiv 2608.08239) | No |
+| **Guardrails, tool/MCP allow-lists, batch routing** | Standard features, later phases | No |
+
+Dropped from the earlier plan: **complexity routing** (Not Diamond, Martian and many papers cover it) and **request hedging** (it doubles spend, which conflicts with the cost goals).
+
+## Research track
+
+The quality circuit breaker is designed so it can also be written up as a paper.
+
+**Question.** Using only passive, content-free metadata from production traffic, how quickly can a multi-tenant gateway detect a silent provider-side degradation? Can it attribute that degradation to the provider rather than to a shift in traffic, at a user-chosen false-alarm rate?
+
+**Why it is open (as of Oct 2026):**
+- **Endpoint monitoring uses active probes.** Fixed prompt sets are sampled on a schedule ("Behavioral Fingerprints for LLM Endpoint Stability", arXiv 2603.19022; "Log Probability Tracking of LLM APIs", arXiv 2512.03816). That costs money, detects model *identity* change rather than impact on your traffic, and is not wired into failover.
+- **Agent failure monitors work per episode, not per provider.** "Real-Time Detection and Repair of LLM Agent Failures" (arXiv 2608.02464) also reports that monitors need a per-deployment healthy baseline, which this design gets for free from the fleet.
+- **Gateway circuit breakers trip only on HTTP errors.**
+- **Nobody uses the gateway's position to separate provider drift from traffic drift.**
+
+**Planned evaluation:**
+- **Fault injection on open models served with vLLM behind the gateway.** Faults are modelled on real incident classes:
+  - quantization swap
+  - top-k/top-p sampling bug
+  - context truncation / long-context misrouting
+  - dropped system prompt
+  - tokenizer/template mismatch
+  - throttled decode
+- **Traffic:** public chat and agent datasets, split into synthetic "tenants".
+- **Metrics:**
+  - detection delay at fixed false-alarm rates
+  - attribution accuracy when a traffic shift and a provider fault happen together
+  - user-visible bad responses avoided by failover
+  - comparison with active probing at equal dollar cost
+
+## Tech stack
 
 ## Tech stack
 
@@ -246,8 +312,12 @@ Each phase ends with something demoable.
 - OpenTelemetry traces/metrics, dashboard: cost, cache hit rate, $ saved, failovers, gateway overhead
 - k6 results published in this README
 
-### Phase 6 — Differentiators
-- Agent cost controls (session budgets, loop detection) first, then complexity routing and shadow traffic
+### Phase 6 — Quality circuit breaker and research
+- Per-response quality signals recorded in the ledger (from Phase 3 onward, so baselines exist early)
+- Sequential detectors per (provider, model, region), cross-tenant attribution test, graded breaker actions
+- vLLM fault-injection harness and evaluation; paper draft
+- Cache-break diagnosis, agent session budgets and loop detection, shadow traffic
+- **Done when:** an injected quantization swap on one provider is detected and failed over within a published detection delay, at the configured false-alarm rate, while a simultaneous tenant traffic shift is *not* blamed on the provider
 
 ### Phase 7 — Infra & polish
 - Terraform modules and environments, GitHub Actions CI/CD with OIDC
@@ -262,4 +332,4 @@ Each phase ends with something demoable.
 
 ## Request path (end to end)
 
-Client -> ALB -> Fargate (FastAPI) -> API-key auth -> token-aware rate limit and budget check (Redis) -> exact then semantic cache (Redis) -> hit: return cached response / miss: router -> circuit breaker -> provider adapter (Bedrock, Anthropic, OpenAI, ...) with fallback -> streamed response -> usage event to the ledger, with OpenTelemetry tracing every hop and Sentry capturing exceptions and failover events.
+Client -> ALB -> Fargate (FastAPI) -> API-key auth -> token-aware rate limit and budget check (Redis) -> exact then semantic cache (Redis) -> hit: return cached response / miss: router -> circuit breaker -> provider adapter (Bedrock, Anthropic, OpenAI, ...) with fallback -> streamed response -> quality signals feed the quality breaker -> usage event to the ledger, with OpenTelemetry tracing every hop and Sentry capturing exceptions and failover events.
