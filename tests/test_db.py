@@ -79,3 +79,32 @@ def test_gateway_writes_one_ledger_row_per_request(postgres_url):
     assert [(r.tenant, r.session_id, r.stream, r.status) for r in result] == [
         ("acme", "run-42", False, 200), ("acme", "run-42", True, 200)]  # fmt: skip
     assert float(result[0].cost_usd) == 2.0 / 1e6  # one completion token at $2 per million
+
+
+async def test_writer_keeps_creating_partitions_while_running(postgres_url):
+    import asyncio
+
+    engine = db.make_engine(postgres_url)
+    writer = db.LedgerWriter(engine, interval_s=0.01)
+    writer.partition_check_s = 0.0
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                f"DROP TABLE IF EXISTS {db.partition_name(db.add_months(dt.datetime.now(dt.UTC).date().replace(day=1), 2))}"
+            )
+        )
+    writer.start()
+    await asyncio.sleep(0.2)
+    await writer.stop()
+    async with engine.connect() as conn:
+        names = (
+            (
+                await conn.execute(
+                    text("SELECT tablename FROM pg_tables WHERE tablename LIKE 'usage_ledger_2%'")
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert db.partition_name(db.add_months(dt.datetime.now(dt.UTC).date().replace(day=1), 2)) in names
+    await engine.dispose()

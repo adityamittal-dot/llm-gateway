@@ -178,6 +178,7 @@ class LedgerWriter:
         self.engine = engine
         self.queue: asyncio.Queue[dict] = asyncio.Queue(max_queue)
         self.batch, self.interval_s = batch, interval_s
+        self.partition_check_s = 6 * 3600.0
         self.dropped = 0
         self.written = 0
         self._task: asyncio.Task | None = None
@@ -210,12 +211,20 @@ class LedgerWriter:
         return len(rows)
 
     async def _run(self) -> None:
+        last_partition_check = asyncio.get_running_loop().time()
         while True:
             await asyncio.sleep(self.interval_s)
             try:
                 await self.flush()
             except Exception:  # the database being down must not take the gateway down
                 log.exception("ledger flush failed")
+            # Long-running processes keep creating next months' partitions (startup alone isn't enough).
+            if asyncio.get_running_loop().time() - last_partition_check >= self.partition_check_s:
+                last_partition_check = asyncio.get_running_loop().time()
+                try:
+                    await ensure_partitions(self.engine)
+                except Exception:
+                    log.exception("ledger partition check failed")
 
     def start(self) -> None:
         if self._task is None:
