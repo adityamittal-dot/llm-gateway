@@ -17,9 +17,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from llm_gateway.research import attribution as A
 from llm_gateway.research import harness as H
-from llm_gateway.research.edetector import EDetector, conformal_pvalues
-from llm_gateway.research.features import QUALITY
+from llm_gateway.research.edetector import EDetector, conformal_pvalues, mixture_e
+from llm_gateway.research.features import ALL, GROUPS, QUALITY
 
 RESULTS = Path("results")
 PROVIDER, HEALTHY, HEALTHY_TEST = "ollama-qwen", "qwen_healthy", "qwen_healthy_2"
@@ -103,7 +104,53 @@ def detectors(df: pd.DataFrame, table: H.Table, args) -> pd.DataFrame:
     return evaluate(table, dets, args)
 
 
-EXPERIMENTS = {"baselines": baselines, "detectors": detectors}
+def attribution(df: pd.DataFrame, table: H.Table, args) -> pd.DataFrame:
+    """Day 10: provider fault vs traffic shift, with Llama as the control provider."""
+    llama, _ = H.build_table(df, "ollama-llama", "llama_healthy")
+    a = A.Side(table, mixture_e(conformal_pvalues(table, QUALITY, HEALTHY)), HEALTHY_TEST, "qwen_shifted")
+    b = A.Side(
+        llama, mixture_e(conformal_pvalues(llama, QUALITY, "llama_healthy")), "llama_healthy", "llama_shifted"
+    )
+    rows = []
+    for fault in conditions_present(table):
+        if fault == "throttle":  # latency-only; not visible to the quality signals by design
+            continue
+        a.fault = f"qwen_{fault}"
+        for p in (0.3, 1.0):
+            for row in A.run(
+                a, b, args.reps, TAU, 1500, p, float(np.log(TARGET_ARL)), seed=stable_seed(fault, p)
+            ):
+                rows.append({"fault": fault, **row})
+        print(f"attribution done: {fault}", flush=True)
+    return pd.DataFrame(rows)
+
+
+def ablation(df: pd.DataFrame, table: H.Table, args) -> pd.DataFrame:
+    """Day 10: which signal groups catch which faults (pooled e-detector, theory threshold)."""
+    sets = {name: feats for name, feats in GROUPS.items()} | {
+        "quality (all content)": QUALITY,
+        "all incl. latency": ALL,
+    }
+    rows = []
+    log_c = float(np.log(TARGET_ARL))
+    for name, feats in sets.items():
+        det = EDetector(conformal_pvalues(table, feats, HEALTHY))
+        for fault in conditions_present(table):
+            rng = np.random.default_rng(stable_seed("ablation", name, fault))
+            paths = [det(table, H.make_stream(table, rng, TAU + HORIZON, HEALTHY_TEST, f"qwen_{fault}", TAU, 0.3))
+                     for _ in range(args.reps)]  # fmt: skip
+            d = H.detection(paths, log_c, TAU)
+            rows.append({"signals": name, "fault": fault, "severity": 0.3, **asdict(d)})
+        print(f"ablation done: {name}", flush=True)
+    return pd.DataFrame(rows)
+
+
+EXPERIMENTS = {
+    "baselines": baselines,
+    "detectors": detectors,
+    "attribution": attribution,
+    "ablation": ablation,
+}
 
 
 def main() -> None:
