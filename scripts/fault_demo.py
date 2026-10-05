@@ -31,7 +31,10 @@ CASES = [
     ("sampling", [{"name": "sampling", "params": {"temperature": 2.0}}]),
     ("output_cap", [{"name": "output_cap", "params": {"max_tokens": 6}}]),
     ("quant_swap", [{"name": "quant_swap", "params": {"model": "qwen2.5:1.5b-instruct-q2_K"}}]),
-    ("model_substitution", [{"name": "model_substitution", "params": {"model": "llama3.2:1b-instruct-q8_0"}}]),
+    (
+        "model_substitution",
+        [{"name": "model_substitution", "params": {"model": "llama3.2:1b-instruct-q8_0"}}],
+    ),
     ("throttle", [{"name": "throttle", "params": {"delay_s": 0.5}}]),
 ]
 
