@@ -1,0 +1,44 @@
+# Local stack: gateway + mock LLM + Redis Stack + Postgres.
+#   docker compose up --build
+#   curl localhost:8000/v1/chat/completions -H 'Authorization: Bearer sk-dev-local' \
+#        -H 'Content-Type: application/json' -d '{"model":"mock-small","messages":[{"role":"user","content":"hi"}]}'
+services:
+  gateway:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      GATEWAY_CONFIG: /app/config/compose.yaml
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://gateway:gateway@postgres:5432/gateway
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes: ["gateway-data:/app/data"]
+    depends_on:
+      mock-llm: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+
+  mock-llm:
+    build: .
+    command: ["llm-gateway-mock"]
+    environment: {MOCK_HOST: 0.0.0.0, MOCK_PORT: "9000", MOCK_TTFT_MS: "50", MOCK_TOKENS_PER_S: "200"}
+    ports: ["9000:9000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/healthz')"]
+      interval: 5s
+      timeout: 3s
+
+  redis:
+    image: redis/redis-stack-server:7.4.0-v3
+    ports: ["6379:6379"]
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s}
+
+  postgres:
+    image: postgres:16-alpine
+    environment: {POSTGRES_USER: gateway, POSTGRES_PASSWORD: gateway, POSTGRES_DB: gateway}
+    ports: ["5432:5432"]
+    volumes: ["pg-data:/var/lib/postgresql/data"]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U gateway"], interval: 5s, timeout: 3s}
+
+volumes:
+  gateway-data:
+  pg-data:

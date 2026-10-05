@@ -1,0 +1,12 @@
+# Gateway config used by docker-compose.yml.
+require_auth: true
+admin_key: dev-admin
+signal_dir: /app/data/signals
+keys:
+  - {key: sk-dev-local, tenant: dev}
+  - {key: sk-tenant-a, tenant: tenant-a}
+  - {key: sk-tenant-b, tenant: tenant-b}
+providers:
+  - {name: mock, type: openai_compat, base_url: "http://mock-llm:9000/v1", models: [mock-small, mock-large]}
+  # Ollama on the host machine (if running): any pulled model.
+  - {name: ollama, type: openai_compat, base_url: "http://host.docker.internal:11434/v1", models: ["*"]}
