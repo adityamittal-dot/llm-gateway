@@ -131,3 +131,24 @@ def test_gateway_quality_breaker_moves_traffic_off_a_silently_degraded_provider(
         state = gw.get("/admin/quality", headers={"X-Admin-Key": "adm"}).json()
     assert state["providers"]["primary"]["level"] == 3
     assert served[-20:] == ["backup"] * 20
+
+
+def test_conversation_growth_is_not_reported_as_an_edit():
+    d = CacheBreakDetector()
+    first = {"messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "q1"}]}
+    usage = lambda cached: {"prompt_tokens": 4000, "prompt_tokens_details": {"cached_tokens": cached}}
+    d.observe("t", "m", first, usage(3500))
+    grown = {
+        "messages": first["messages"]
+        + [{"role": "assistant", "content": "a1"}, {"role": "user", "content": "q2"}]
+    }
+    assert d.observe("t", "m", grown, usage(0))["changed_block"] is None
+
+
+def test_cache_hits_still_count_toward_session_limits():
+    settings = Settings(tenants={"anonymous": {"session_max_requests": 3}})
+    with TestClient(create_app(settings, providers=[FakeProvider(models=["m"])])) as gw:
+        headers = {"x-cache": "exact", "x-session-id": "agent-1"}
+        body = {"model": "m", "messages": [{"role": "user", "content": "same"}]}
+        codes = [gw.post("/v1/chat/completions", json=body, headers=headers).status_code for _ in range(5)]
+    assert codes == [200, 200, 200, 429, 429]

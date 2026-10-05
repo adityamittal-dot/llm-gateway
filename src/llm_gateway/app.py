@@ -228,6 +228,14 @@ def create_app(
                  "cache_status": f"hit-{hit.kind}", "failovers": 0,
                  "finish_reason": response["choices"][0].get("finish_reason"), "quality": {"saved_usd": saved}}
             )  # fmt: skip
+        tool_calls = response["choices"][0].get("message", {}).get("tool_calls") or []
+        if await request.app.state.sessions.after_response(
+            tenant, request.headers.get("x-session-id"), 0.0, tool_calls
+        ):
+            log.warning(
+                "agent_loop_detected",
+                extra={"tenant": tenant, "session_id": request.headers.get("x-session-id")},
+            )
         if not body.get("stream"):
             return JSONResponse(response, headers=headers)
 
@@ -275,6 +283,13 @@ def create_app(
                 "model_not_found",
             )
 
+        # Session controls come first: a looping agent re-sending an identical request must be stopped
+        # even when the answer would come from the cache.
+        session_id = request.headers.get("x-session-id")
+        if blocked := await request.app.state.sessions.admit(tenant, session_id):
+            request.app.state.metrics.rate_limited.add(1, {"tenant": tenant, "reason": blocked[0]})
+            return openai_error(429, blocked[1], "rate_limit_exceeded", blocked[0])
+
         # Cache before limits: a hit costs no provider tokens, so it is not rate limited or charged.
         cache: ResponseCache = request.app.state.cache
         cache_mode = cache.mode(request.headers.get("x-cache"), body)
@@ -296,12 +311,6 @@ def create_app(
             resp = openai_error(429, "Rate limit exceeded.", "rate_limit_exceeded", "rate_limit_exceeded")
             resp.headers["Retry-After"] = str(max(1, -(-wait_ms // 1000)))
             return resp
-
-        session_id = request.headers.get("x-session-id")
-        if blocked := await request.app.state.sessions.admit(tenant, session_id):
-            await limiter.settle(reservation, 0)
-            request.app.state.metrics.rate_limited.add(1, {"tenant": tenant, "reason": blocked[0]})
-            return openai_error(429, blocked[1], "rate_limit_exceeded", blocked[0])
 
         request_id = uuid.uuid4().hex
         headers = {"X-Request-Id": request_id}

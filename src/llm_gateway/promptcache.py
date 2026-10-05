@@ -76,8 +76,10 @@ class CacheBreakDetector:
 
     @staticmethod
     def _diagnose(prev: dict, cur: dict) -> dict:
-        for i, (label, digest) in enumerate(cur["blocks"]):
-            if i >= len(prev["blocks"]) or prev["blocks"][i] != (label, digest):
+        # Only the shared prefix matters: blocks appended after the previous prompt (a conversation
+        # that simply grew) cannot have invalidated the cached prefix.
+        for i, (label, digest) in enumerate(cur["blocks"][: len(prev["blocks"])]):
+            if prev["blocks"][i] != (label, digest):
                 if label == "tools":
                     if prev["tools"] == cur["tools"]:
                         hint = "tools are the same but in a different order: render them deterministically"
