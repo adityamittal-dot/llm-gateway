@@ -12,11 +12,13 @@ dependencies = [
     "httpx>=0.28.1",
     "pyarrow>=25.0.1",
     "pyyaml>=6.0.3",
+    "redis>=8.1.0",
     "uvicorn[standard]>=0.54.0",
 ]
 
 [project.scripts]
 llm-gateway = "llm_gateway:main"
+llm-gateway-mock = "llm_gateway.mock_llm:main"
 
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]
@@ -25,8 +27,10 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "anyio>=4.15.1",
+    "fakeredis>=2.39.0",
     "openai>=3.24.0",
     "pandas>=3.0.6",
+    "pgserver>=0.1.4",
     "pytest>=9.1.1",
     "ruff>=0.16.10",
 ]
