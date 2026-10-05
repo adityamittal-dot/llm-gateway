@@ -22,6 +22,7 @@ from llm_gateway.config import Settings, hash_key
 from llm_gateway.faults import FaultInjector, parse_faults
 from llm_gateway.providers import ErrorKind, Provider, ProviderError, Registry, build_provider
 from llm_gateway.providers.openai_compat import OpenAICompatProvider
+from llm_gateway.retries import Retrier, RetryPolicy
 from llm_gateway.signal_log import SignalLog
 
 log = logging.getLogger("llm_gateway.access")
@@ -78,6 +79,7 @@ def create_app(
         app.state.signal_log.start()
         app.state.regenerates = sig.RegenerateTracker()
         app.state.faults = FaultInjector(parse_faults(settings.faults))
+        app.state.retrier = Retrier(RetryPolicy.from_config(settings.retry))
         try:
             yield
         finally:
@@ -183,9 +185,15 @@ def create_app(
                 },
             )
 
+        retrier: Retrier = request.app.state.retrier
+
+        def on_retry(attempt: int, err: ProviderError, delay: float) -> None:
+            log.warning("retry", extra={"request_id": request_id, "provider": provider.name, "attempt": attempt,
+                                        "error_kind": err.kind.value, "delay_ms": round(delay * 1000)})  # fmt: skip
+
         if not body.get("stream"):
             try:
-                result = await provider.complete(applied.body)
+                result = await retrier.call(provider.name, lambda: provider.complete(applied.body), on_retry)
             except ProviderError as err:
                 record(err.status)
                 return provider_error_response(err, headers)
@@ -199,11 +207,15 @@ def create_app(
 
         # Streaming: fetch the first chunk before answering, so an upstream error that happens
         # before any token is returned as a proper HTTP error (and can trigger failover).
-        chunks = provider.stream(applied.body)
+        async def open_stream():
+            stream = provider.stream(applied.body)
+            try:
+                return stream, await anext(stream)
+            except StopAsyncIteration:
+                return stream, None
+
         try:
-            first = await anext(chunks)
-        except StopAsyncIteration:
-            first = None
+            chunks, first = await retrier.call(provider.name, open_stream, on_retry)
         except ProviderError as err:
             record(err.status)
             return provider_error_response(err, headers)
