@@ -69,6 +69,8 @@ class Settings:
     prices: dict = field(default_factory=dict)
     # Postgres (postgresql+asyncpg://...): usage ledger and versioned prices. Optional.
     database_url: str | None = None
+    # Response cache (cache.CacheConfig fields).
+    cache: dict = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -97,6 +99,7 @@ class Settings:
             orgs=dict(file_cfg.get("orgs") or {}),
             prices=dict(file_cfg.get("prices") or {}),
             database_url=os.environ.get("DATABASE_URL") or file_cfg.get("database_url"),
+            cache=dict(file_cfg.get("cache") or {}),
         )
 
     def provider_configs(self) -> list[dict]:
