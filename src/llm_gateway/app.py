@@ -5,17 +5,19 @@ default). Streaming responses are relayed chunk by chunk. Every response produce
 of passive quality signals (see signals.py).
 """
 
+import asyncio
 import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from llm_gateway import signals as sig
 from llm_gateway.config import Settings
+from llm_gateway.faults import FaultInjector, parse_faults, restore_model_name
 from llm_gateway.signal_log import SignalLog
 
 
@@ -48,6 +50,7 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
         app.state.signal_log = SignalLog(settings.signal_dir)
         app.state.signal_log.start()
         app.state.regenerates = sig.RegenerateTracker()
+        app.state.faults = FaultInjector(parse_faults(settings.faults))
         try:
             yield
         finally:
@@ -63,6 +66,27 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
         signals = sig.extract(provider=settings.provider_name, **kwargs)
         request.app.state.signal_log.append(signals)
         return signals
+
+    def require_admin(key: str | None) -> None:
+        if not settings.admin_key:
+            raise HTTPException(404)
+        if key != settings.admin_key:
+            raise HTTPException(401, "invalid admin key")
+
+    @app.get("/admin/faults")
+    async def get_faults(request: Request, x_admin_key: str | None = Header(None)) -> list[dict]:
+        require_admin(x_admin_key)
+        return [vars(f) for f in request.app.state.faults.faults]
+
+    @app.put("/admin/faults")
+    async def put_faults(request: Request, x_admin_key: str | None = Header(None)) -> list[dict]:
+        require_admin(x_admin_key)
+        try:
+            faults = parse_faults(await request.json())
+        except (ValueError, KeyError, TypeError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        request.app.state.faults.set(faults)
+        return [vars(f) for f in faults]
 
     @app.get("/healthz")
     async def healthz() -> dict:
@@ -94,10 +118,13 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
             "regenerate": request.app.state.regenerates.seen_recently(tenant, sig.prompt_hash(body)),
         }
 
+        applied = request.app.state.faults.apply(body)
+        common["truth_fault"] = applied.fault
+
         http: httpx.AsyncClient = request.app.state.client
         try:
             upstream = await http.send(
-                http.build_request("POST", "/chat/completions", json=body), stream=True
+                http.build_request("POST", "/chat/completions", json=applied.body), stream=True
             )
         except httpx.HTTPError as exc:
             error = upstream_unavailable(exc)
@@ -107,9 +134,8 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
 
         # Errors and non-streaming results are returned whole, with the upstream status code.
         if not body.get("stream") or upstream.status_code != 200:
-            content = await upstream.aread()
+            content = restore_model_name(await upstream.aread(), applied)
             await upstream.aclose()
-            finished = time.time()
             message, finish_reason, usage = None, None, None
             if upstream.status_code == 200:
                 try:
@@ -122,6 +148,9 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
                     )
                 except ValueError:
                     pass
+            if applied.chunk_delay_s and usage:
+                await asyncio.sleep(applied.chunk_delay_s * (usage.get("completion_tokens") or 0) / 10)
+            finished = time.time()
             record(request, **common, status_code=upstream.status_code, finished=finished,
                    first_token_at=None, message=message, finish_reason=finish_reason, usage=usage)  # fmt: skip
             media_type = upstream.headers.get("content-type", "application/json")
@@ -135,7 +164,9 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
                     if first_token_at is None:
                         first_token_at = time.time()
                     acc.feed(chunk)
-                    yield chunk
+                    if applied.chunk_delay_s:
+                        await asyncio.sleep(applied.chunk_delay_s)
+                    yield restore_model_name(chunk, applied)
             finally:
                 await upstream.aclose()
                 record(request, **common, status_code=200, finished=time.time(), first_token_at=first_token_at,

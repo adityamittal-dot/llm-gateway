@@ -21,6 +21,10 @@ class Settings:
     signal_dir: str | None = None
     # API key -> tenant name.
     keys: dict[str, str] = field(default_factory=dict)
+    # Research fault injection (faults.py); each entry is {name, p, params}.
+    faults: list[dict] = field(default_factory=list)
+    # Enables /admin endpoints when set (sent as the X-Admin-Key header).
+    admin_key: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -33,6 +37,8 @@ class Settings:
             read_timeout_s=float(os.environ.get("UPSTREAM_READ_TIMEOUT_S", cls.read_timeout_s)),
             signal_dir=os.environ.get("SIGNAL_DIR") or file_cfg.get("signal_dir"),
             keys={str(k["key"]): str(k["tenant"]) for k in file_cfg.get("keys", [])},
+            faults=list(file_cfg.get("faults") or []),
+            admin_key=os.environ.get("ADMIN_KEY") or file_cfg.get("admin_key"),
         )
 
 
