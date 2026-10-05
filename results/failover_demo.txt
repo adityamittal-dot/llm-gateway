@@ -1,0 +1,5 @@
+1. healthy                             served_by={'primary': 15}  http={200: 15}     24 ms/req  breakers: primary=closed, backup=closed
+2. primary hangs (5 s latency toxic)   served_by={'backup': 15}  http={200: 15}   1661 ms/req  breakers: primary=open, backup=closed
+3. still broken (breaker open: skip)   served_by={'backup': 15}  http={200: 15}     20 ms/req  breakers: primary=open, backup=closed
+4. primary healed, cooldown running    served_by={'backup': 15}  http={200: 15}     19 ms/req  breakers: primary=open, backup=closed
+5. after cooldown: probe closes breaker served_by={'primary': 15}  http={200: 15}     22 ms/req  breakers: primary=closed, backup=closed

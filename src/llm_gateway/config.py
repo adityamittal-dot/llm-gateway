@@ -54,6 +54,13 @@ class Settings:
     log_level: str = "INFO"
     # Retry policy overrides (retries.RetryPolicy fields).
     retry: dict = field(default_factory=dict)
+    # Circuit breaker overrides (breaker.BreakerConfig fields).
+    breaker: dict = field(default_factory=dict)
+    # Model alias -> ordered fallback chain. Entries are model names (served by whichever provider
+    # serves them) or {provider: name, model: id} to pin a provider.
+    routes: dict = field(default_factory=dict)
+    # Shared state (breaker, rate limits, caches). Without it, state is per process.
+    redis_url: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -74,6 +81,9 @@ class Settings:
             admin_key=os.environ.get("ADMIN_KEY") or file_cfg.get("admin_key"),
             log_level=os.environ.get("LOG_LEVEL", file_cfg.get("log_level", cls.log_level)),
             retry=dict(file_cfg.get("retry") or {}),
+            breaker=dict(file_cfg.get("breaker") or {}),
+            routes=dict(file_cfg.get("routes") or {}),
+            redis_url=os.environ.get("REDIS_URL") or file_cfg.get("redis_url"),
         )
 
     def provider_configs(self) -> list[dict]:

@@ -16,8 +16,10 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from redis.asyncio import from_url as redis_from_url
 
 from llm_gateway import signals as sig
+from llm_gateway.breaker import BreakerConfig, CircuitBreaker, MemoryStore, RedisStore
 from llm_gateway.config import Settings, hash_key
 from llm_gateway.faults import FaultInjector, parse_faults
 from llm_gateway.providers import ErrorKind, Provider, ProviderError, Registry, build_provider
@@ -57,6 +59,7 @@ def create_app(
     settings: Settings | None = None,
     client: httpx.AsyncClient | None = None,
     providers: list[Provider] | None = None,
+    redis_client=None,
 ) -> FastAPI:
     """`client` (tests) wraps a ready httpx client as the single provider; `providers` replaces config."""
     settings = settings or Settings.from_env()
@@ -74,7 +77,10 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.registry = Registry(make_providers())
+        app.state.registry = Registry(make_providers(), settings.routes)
+        app.state.redis = redis_client or (redis_from_url(settings.redis_url) if settings.redis_url else None)
+        store = RedisStore(app.state.redis) if app.state.redis is not None else MemoryStore()
+        app.state.breaker = CircuitBreaker(store, BreakerConfig.from_config(settings.breaker))
         app.state.signal_log = SignalLog(settings.signal_dir)
         app.state.signal_log.start()
         app.state.regenerates = sig.RegenerateTracker()
@@ -85,6 +91,8 @@ def create_app(
         finally:
             await app.state.signal_log.stop()
             await app.state.registry.aclose()
+            if app.state.redis is not None and redis_client is None:
+                await app.state.redis.aclose()
 
     app = FastAPI(title="LLM Gateway", lifespan=lifespan)
 
@@ -108,6 +116,11 @@ def create_app(
             raise HTTPException(400, str(exc)) from exc
         request.app.state.faults.set(faults)
         return [vars(f) for f in faults]
+
+    @app.get("/admin/breakers")
+    async def get_breakers(request: Request, x_admin_key: str | None = Header(None)) -> dict:
+        require_admin(x_admin_key)
+        return await request.app.state.breaker.snapshot(list(request.app.state.registry.providers))
 
     @app.get("/healthz")
     async def healthz() -> dict:
@@ -136,8 +149,8 @@ def create_app(
         if not isinstance(body, dict):
             return openai_error(400, "Request body must be a JSON object.", "invalid_request_error")
         model = str(body.get("model") or "")
-        provider: Provider | None = request.app.state.registry.resolve(model)
-        if provider is None:
+        candidates = request.app.state.registry.candidates(model)
+        if not candidates:
             return openai_error(
                 404,
                 f"Model {model!r} is not served by this gateway.",
@@ -147,17 +160,19 @@ def create_app(
 
         request_id = uuid.uuid4().hex
         headers = {"X-Request-Id": request_id}
-        applied = request.app.state.faults.apply(body)
         common = {
             "request_id": request_id,
             "tenant": tenant,
             "body": body,
             "started": time.time(),
             "regenerate": request.app.state.regenerates.seen_recently(tenant, sig.prompt_hash(body)),
-            "truth_fault": applied.fault,
         }
+        breaker: CircuitBreaker = request.app.state.breaker
+        retrier: Retrier = request.app.state.retrier
+        attempts: list[dict] = []  # one entry per provider tried, for logs and the signal row
 
-        def record(status: int, first_token_at=None, message=None, finish_reason=None, usage=None) -> None:
+        def record(provider: Provider, applied, status: int, first_token_at=None, message=None,
+                   finish_reason=None, usage=None) -> None:  # fmt: skip
             signals = sig.extract(
                 provider=provider.name,
                 status_code=status,
@@ -166,8 +181,11 @@ def create_app(
                 message=message,
                 finish_reason=finish_reason,
                 usage=usage,
+                truth_fault=applied.fault if applied else None,
                 **common,
             )
+            if len(attempts) > 1 or any(a["outcome"] != "ok" for a in attempts):
+                signals.extra["attempts"] = attempts
             request.app.state.signal_log.append(signals)
             log.info(
                 "request",
@@ -182,43 +200,82 @@ def create_app(
                     "prompt_tokens": signals.prompt_tokens,
                     "completion_tokens": signals.completion_tokens,
                     "finish_reason": finish_reason,
+                    "failovers": max(0, len(attempts) - 1),
                 },
             )
 
-        retrier: Retrier = request.app.state.retrier
+        def on_retry_for(provider: Provider):
+            def on_retry(attempt: int, err: ProviderError, delay: float) -> None:
+                log.warning("retry", extra={"request_id": request_id, "provider": provider.name, "attempt": attempt,
+                                            "error_kind": err.kind.value, "delay_ms": round(delay * 1000)})  # fmt: skip
 
-        def on_retry(attempt: int, err: ProviderError, delay: float) -> None:
-            log.warning("retry", extra={"request_id": request_id, "provider": provider.name, "attempt": attempt,
-                                        "error_kind": err.kind.value, "delay_ms": round(delay * 1000)})  # fmt: skip
+            return on_retry
 
-        if not body.get("stream"):
-            try:
-                result = await retrier.call(provider.name, lambda: provider.complete(applied.body), on_retry)
-            except ProviderError as err:
-                record(err.status)
-                return provider_error_response(err, headers)
-            result["model"] = model  # a substituted model stays invisible to the client
-            choice = (result.get("choices") or [{}])[0]
-            usage = result.get("usage") or {}
-            if applied.chunk_delay_s:
-                await asyncio.sleep(applied.chunk_delay_s * (usage.get("completion_tokens") or 0) / 10)
-            record(200, None, choice.get("message"), choice.get("finish_reason"), usage)
-            return JSONResponse(result, headers=headers)
-
-        # Streaming: fetch the first chunk before answering, so an upstream error that happens
-        # before any token is returned as a proper HTTP error (and can trigger failover).
-        async def open_stream():
-            stream = provider.stream(applied.body)
+        async def open_stream(provider: Provider, send_body: dict):
+            stream = provider.stream(send_body)
             try:
                 return stream, await anext(stream)
             except StopAsyncIteration:
                 return stream, None
 
-        try:
-            chunks, first = await retrier.call(provider.name, open_stream, on_retry)
-        except ProviderError as err:
-            record(err.status)
-            return provider_error_response(err, headers)
+        # Walk the fallback chain: skip providers whose breaker is open, fail over on provider
+        # errors, never on a bad request (it would fail everywhere). Streams can only fail over
+        # before the first chunk, which is why the first chunk is fetched here.
+        last_error: ProviderError | None = None
+        for provider, target in candidates:
+            if not await breaker.allow(provider.name):
+                attempts.append({"provider": provider.name, "outcome": "breaker_open"})
+                continue
+            applied = request.app.state.faults.apply({**body, "model": target})
+            try:
+                if body.get("stream"):
+                    opened = await retrier.call(
+                        provider.name,
+                        lambda p=provider, b=applied.body: open_stream(p, b),
+                        on_retry_for(provider),
+                    )
+                else:
+                    result = await retrier.call(
+                        provider.name,
+                        lambda p=provider, b=applied.body: p.complete(b),
+                        on_retry_for(provider),
+                    )
+            except ProviderError as err:
+                await breaker.record(provider.name, err.kind)
+                attempts.append({"provider": provider.name, "outcome": err.kind.value})
+                last_error = err
+                if err.kind is ErrorKind.BAD_REQUEST:
+                    break
+                log.warning("failover", extra={"request_id": request_id, "provider": provider.name,
+                                               "error_kind": err.kind.value})  # fmt: skip
+                continue
+            await breaker.record(provider.name, None)
+            attempts.append({"provider": provider.name, "outcome": "ok"})
+            break
+        else:
+            provider = candidates[-1][0]
+            applied = None
+            if last_error is None:  # every candidate was skipped by an open breaker
+                last_error = ProviderError(
+                    ErrorKind.OVERLOADED, "All providers for this model are unavailable."
+                )
+            record(provider, applied, last_error.status)
+            return provider_error_response(last_error, headers)
+        if attempts[-1]["outcome"] != "ok":  # bad request: stop without failover
+            record(provider, applied, last_error.status)
+            return provider_error_response(last_error, headers)
+        headers["X-Gateway-Provider"] = provider.name
+
+        if not body.get("stream"):
+            result["model"] = model  # the client sees the model it asked for, whoever answered
+            choice = (result.get("choices") or [{}])[0]
+            usage = result.get("usage") or {}
+            if applied.chunk_delay_s:
+                await asyncio.sleep(applied.chunk_delay_s * (usage.get("completion_tokens") or 0) / 10)
+            record(provider, applied, 200, None, choice.get("message"), choice.get("finish_reason"), usage)
+            return JSONResponse(result, headers=headers)
+
+        chunks, first = opened
 
         async def relay() -> AsyncIterator[bytes]:
             acc = sig.StreamAccumulator()
@@ -238,6 +295,7 @@ def create_app(
                         pass
                 yield sse("[DONE]")
             except ProviderError as err:  # mid-stream: too late to fail over; tell the client in-band
+                await breaker.record(provider.name, err.kind)
                 error = {
                     "message": err.message,
                     "type": "upstream_error",
@@ -245,7 +303,7 @@ def create_app(
                 }
                 yield sse({"error": error})
             finally:
-                record(200, first_token_at, acc.message(), acc.finish_reason, acc.usage)
+                record(provider, applied, 200, first_token_at, acc.message(), acc.finish_reason, acc.usage)
 
         return StreamingResponse(
             relay(),
