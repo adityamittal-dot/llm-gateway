@@ -24,6 +24,7 @@ GROUPS: dict[str, list[str]] = {
 }
 QUALITY = [f for g in ("length", "tools", "refusal", "repetition") for f in GROUPS[g]]
 ALL = QUALITY + GROUPS["latency"]
+INPUT = ["log_prompt_tokens"]
 BINARY = {"finish_length", "tool_called", "tool_valid", "refusal", "empty"}
 
 
@@ -46,6 +47,9 @@ def featurize(df: pd.DataFrame) -> pd.DataFrame:
     out["repetition"] = df["repetition"].astype(float)
     out["log_ttft"] = np.log(df["ttft_s"].astype(float).clip(lower=1e-3))
     out["log_tps"] = np.log(df["tokens_per_s"].astype(float).clip(lower=1e-2))
+    # Input side (what the tenant sent, not what the provider returned): used to recognise traffic shifts.
+    prompt = df["prompt_tokens"] if "prompt_tokens" in df else pd.Series(np.nan, index=df.index)
+    out["log_prompt_tokens"] = np.log1p(prompt.astype(float))
     return out
 
 

@@ -20,7 +20,7 @@ import pandas as pd
 from llm_gateway.research import attribution as A
 from llm_gateway.research import harness as H
 from llm_gateway.research.edetector import EDetector, conformal_pvalues, mixture_e
-from llm_gateway.research.features import ALL, GROUPS, QUALITY
+from llm_gateway.research.features import ALL, GROUPS, INPUT, QUALITY
 
 RESULTS = Path("results")
 PROVIDER, HEALTHY, HEALTHY_TEST = "ollama-qwen", "qwen_healthy", "qwen_healthy_2"
@@ -104,13 +104,39 @@ def detectors(df: pd.DataFrame, table: H.Table, args) -> pd.DataFrame:
     return evaluate(table, dets, args)
 
 
+def client_input_sizes(table: H.Table) -> None:
+    """Replace the input feature with the size of the prompt the *client* sent.
+
+    Provider-reported prompt tokens are measured after a fault rewrote the request (truncation,
+    dropped system prompt), so they would make a provider fault look like a traffic change. The
+    gateway knows the client's request before any fault; here it is rebuilt from the deterministic
+    workloads (item id + whether the condition shifted that tenant).
+    """
+    from llm_gateway.research import workloads
+    from llm_gateway.research.record import CONDITIONS
+
+    sizes: dict[tuple[str, bool], int] = {}
+    for shifted in (False, True):
+        for item in workloads.load(list(workloads.TENANTS), 250,
+                                   shifted=tuple(workloads.TENANTS) if shifted else ()):  # fmt: skip
+            sizes[(item.item_id, shifted)] = len(json.dumps(item.body["messages"])) + len(
+                json.dumps(item.body.get("tools", []))
+            )
+    rows = table.rows
+    shifted = [r.tenant in CONDITIONS[r.condition]["shifted"] for r in rows.itertuples()]
+    chars = [sizes[(i, sh)] for i, sh in zip(rows.item_id, shifted, strict=True)]
+    table.feats["log_prompt_tokens"] = np.log1p(np.array(chars, dtype=float) / 4)
+
+
 def attribution(df: pd.DataFrame, table: H.Table, args) -> pd.DataFrame:
     """Day 10: provider fault vs traffic shift, with Llama as the control provider."""
     llama, _ = H.build_table(df, "ollama-llama", "llama_healthy")
-    a = A.Side(table, mixture_e(conformal_pvalues(table, QUALITY, HEALTHY)), HEALTHY_TEST, "qwen_shifted")
-    b = A.Side(
-        llama, mixture_e(conformal_pvalues(llama, QUALITY, "llama_healthy")), "llama_healthy", "llama_shifted"
-    )
+    client_input_sizes(table)
+    client_input_sizes(llama)
+    a = A.Side(table, mixture_e(conformal_pvalues(table, QUALITY, HEALTHY)), HEALTHY_TEST, "qwen_shifted",
+               e_in=mixture_e(conformal_pvalues(table, INPUT, HEALTHY)))  # fmt: skip
+    b = A.Side(llama, mixture_e(conformal_pvalues(llama, QUALITY, "llama_healthy")), "llama_healthy", "llama_shifted",
+               e_in=mixture_e(conformal_pvalues(llama, INPUT, "llama_healthy")))  # fmt: skip
     rows = []
     for fault in conditions_present(table):
         if fault == "throttle":  # latency-only; not visible to the quality signals by design
