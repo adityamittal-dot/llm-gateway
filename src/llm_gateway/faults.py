@@ -15,6 +15,7 @@ Faults (name: param):
 """
 
 import copy
+import json
 import random
 from dataclasses import dataclass, field
 from typing import Any
@@ -105,13 +106,14 @@ def truncate_messages(messages: list[dict], max_tokens: int) -> list[dict]:
     kept: list[dict] = []
     for message in reversed(messages):
         content = message.get("content")
-        text = content if isinstance(content, str) else ""
-        if len(text) <= budget:
+        # Non-string content (multimodal parts, tool calls) is costed by its JSON size, never free.
+        size = len(content) if isinstance(content, str) else len(json.dumps(content or ""))
+        if size <= budget:
             kept.append(message)
-            budget -= len(text)
+            budget -= size
             continue
         if budget > 0 and isinstance(content, str):
-            kept.append({**message, "content": text[-budget:]})
+            kept.append({**message, "content": content[-budget:]})
         break
     return list(reversed(kept)) or messages[-1:]
 

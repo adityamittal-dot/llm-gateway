@@ -5,6 +5,7 @@ including streamed tool calls. `models` maps the public model name to a Bedrock 
 inference profile, e.g. {"nova-micro": "us.amazon.nova-micro-v1:0"}.
 """
 
+import base64
 import json
 import time
 import uuid
@@ -43,6 +44,42 @@ def _text(content: Any) -> str:
     if isinstance(content, list):
         return "".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
     return ""
+
+
+IMAGE_FORMATS = {
+    "image/png": "png",
+    "image/jpeg": "jpeg",
+    "image/jpg": "jpeg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
+
+
+def _blocks(content: Any) -> list[dict]:
+    """OpenAI message content -> Converse content blocks. Text and base64 `data:` images are
+    translated; anything else is rejected rather than silently dropped (Converse cannot fetch URLs)."""
+    if content is None or isinstance(content, str):
+        return [{"text": content or ""}]
+    blocks = []
+    for part in content:
+        kind = part.get("type") if isinstance(part, dict) else None
+        if kind == "text":
+            blocks.append({"text": part.get("text", "")})
+        elif kind == "image_url":
+            url = (part.get("image_url") or {}).get("url", "")
+            header, _, data = url.partition(",")
+            mime = header.removeprefix("data:").removesuffix(";base64")
+            if not url.startswith("data:") or ";base64" not in header or mime not in IMAGE_FORMATS:
+                raise ProviderError(ErrorKind.BAD_REQUEST, "Bedrock adapter accepts images only as base64 data: URLs "
+                                    "(png, jpeg, gif, webp).", 400, "bedrock")  # fmt: skip
+            blocks.append(
+                {"image": {"format": IMAGE_FORMATS[mime], "source": {"bytes": base64.b64decode(data)}}}
+            )
+        else:
+            raise ProviderError(
+                ErrorKind.BAD_REQUEST, f"Unsupported content part for Bedrock: {kind!r}.", 400, "bedrock"
+            )
+    return blocks or [{"text": ""}]
 
 
 def to_converse(body: dict, model_id: str) -> dict:
@@ -86,7 +123,7 @@ def to_converse(body: dict, model_id: str) -> dict:
                 )
             push("assistant", blocks or [{"text": ""}])
         else:
-            push("user", [{"text": _text(m.get("content"))}])
+            push("user", _blocks(m.get("content")))
 
     inference: dict[str, Any] = {}
     max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
