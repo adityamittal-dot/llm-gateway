@@ -85,3 +85,19 @@ def test_gateway_serves_hits_without_calling_the_provider_or_charging_limits():
         assert len(provider.bodies) == 1
         miss = gw.post("/v1/chat/completions", json=body("how tall is the eiffel tower"), headers=auth)
         assert miss.status_code == 429
+
+
+def test_replay_keeps_tool_calls():
+    from llm_gateway.signals import StreamAccumulator
+
+    call = {"id": "c1", "type": "function", "function": {"name": "search", "arguments": '{"q": "x"}'}}
+    resp = {
+        "model": "m",
+        "choices": [{"message": {"content": None, "tool_calls": [call]}, "finish_reason": "tool_calls"}],
+    }
+    acc = StreamAccumulator()
+    for chunk in replay_as_chunks(resp):
+        acc.add(chunk)
+    assert (
+        acc.message()["tool_calls"][0]["function"] == call["function"] and acc.finish_reason == "tool_calls"
+    )
