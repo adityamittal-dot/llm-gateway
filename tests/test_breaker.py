@@ -50,6 +50,17 @@ async def test_breaker_opens_on_failure_ratio_and_recovers_through_a_probe():
         assert (await cb.snapshot(["p"]))["p"]["window_failures"] == 0
 
 
+async def test_bad_request_probe_neither_closes_nor_reopens():
+    for cb, clock in breakers():
+        for _ in range(4):
+            await cb.record("p", ErrorKind.TIMEOUT)
+        clock.t += 31
+        assert await cb.allow("p")
+        await cb.record("p", ErrorKind.BAD_REQUEST)
+        assert await cb.state("p") == "half_open"
+        assert await cb.allow("p")  # the probe lock was released for the next request
+
+
 async def test_bad_requests_do_not_trip_the_breaker():
     for cb, _ in breakers():
         for _ in range(10):

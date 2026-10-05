@@ -1,0 +1,23 @@
+{
+  "vus": 10,
+  "duration": "30s",
+  "direct (mock only)": {
+    "rps": 3689.3,
+    "p50_ms": 2.59,
+    "p90_ms": 2.89,
+    "p99_ms": 3.49,
+    "failed_rate": 0
+  },
+  "through gateway": {
+    "rps": 473.1,
+    "p50_ms": 17.96,
+    "p90_ms": 40.01,
+    "p99_ms": 75.06,
+    "failed_rate": 0
+  },
+  "gateway overhead": {
+    "p50_ms": 15.37,
+    "p90_ms": 37.12,
+    "p99_ms": 71.57
+  }
+}

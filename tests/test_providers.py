@@ -315,3 +315,18 @@ def test_json_formatter_includes_extra_fields():
         and line["status"] == 200
         and line["level"] == "info"
     )
+
+
+def test_bedrock_translates_data_url_images_and_rejects_remote_urls():
+    import base64 as b64
+
+    png = "data:image/png;base64," + b64.b64encode(b"\x89PNG fake").decode()
+    msg = {"role": "user", "content": [{"type": "text", "text": "what is this?"},
+                                       {"type": "image_url", "image_url": {"url": png}}]}  # fmt: skip
+    blocks = to_converse({"messages": [msg]}, "m")["messages"][0]["content"]
+    assert blocks[0] == {"text": "what is this?"}
+    assert blocks[1]["image"]["format"] == "png" and blocks[1]["image"]["source"]["bytes"] == b"\x89PNG fake"
+    remote = {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://x/y.png"}}]}
+    with pytest.raises(ProviderError) as info:
+        to_converse({"messages": [remote]}, "m")
+    assert info.value.kind is ErrorKind.BAD_REQUEST

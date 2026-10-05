@@ -8,3 +8,5 @@ data/
 results/raw/
 .env
 config/gateway.yaml
+results/*.log
+results/cache_eval_pairs.csv

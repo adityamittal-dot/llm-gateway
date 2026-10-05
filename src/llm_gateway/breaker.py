@@ -160,9 +160,10 @@ class CircuitBreaker:
             await self.store.unlock(provider)
             if failed:
                 await self.store.set_state(provider, "open", now)
-            else:
+            elif error is None:  # only a real success proves the provider is back
                 await self.store.clear_window(provider)
                 await self.store.set_state(provider, "closed", 0)
+            # A bad request says nothing about provider health: stay half-open for the next probe.
             return
         await self.store.add(provider, int(now // BUCKET_S), failed, self.config.window_s + BUCKET_S)
         if failed and state == "closed":

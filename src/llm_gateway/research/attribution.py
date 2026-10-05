@@ -15,6 +15,10 @@ Decision rules after a fixed horizon (did we blame provider A?):
     ours        tenants whose detector fires on BOTH providers are flagged as traffic shifts and
                 excluded; blame A only if A's pooled detector over the remaining tenants fires
                 while B's pooled detector over the same tenants does not
+    ours_input  like `ours`, but a tenant also counts as shifted when its *inputs* changed (an
+                input-side detector on prompt length fires on either provider): a provider fault
+                never changes what tenants send, while a traffic shift always does, even when only
+                one provider's outputs react to it
 """
 
 from dataclasses import dataclass
@@ -37,6 +41,7 @@ class Side:
     healthy: str  # healthy test condition
     shifted: str  # traffic-shift condition
     fault: str | None = None  # fault condition (provider A only)
+    e_in: np.ndarray | None = None  # input-side e-value per row (prompt length)
 
 
 def post_conditions(side: Side, scenario: str, is_a: bool) -> dict[str, str]:
@@ -81,12 +86,20 @@ def decide(a: Side, b: Side, idx_a: np.ndarray, idx_b: np.ndarray, log_c: float)
     keep_a = ~np.isin(ta, np.flatnonzero(shifted))
     keep_b = ~np.isin(tb, np.flatnonzero(shifted))
     ours = fired(ea[keep_a], log_c) and not fired(eb[keep_b], log_c)
-    return {
+    out = {
         "pooled": fired(ea, log_c),
         "per_tenant": any(per_tenant_a),
         "ours": ours,
         "ours_flags_shift": any(shifted),
     }
+    if a.e_in is not None and b.e_in is not None:
+        ia, ib = a.e_in[idx_a], b.e_in[idx_b]
+        input_shift = [fired(ia[ta == j], log_c + np.log(2 * k)) or fired(ib[tb == j], log_c + np.log(2 * k))
+                       for j in range(k)]  # fmt: skip
+        excluded = np.flatnonzero([shifted[j] or input_shift[j] for j in range(k)])
+        keep_a, keep_b = ~np.isin(ta, excluded), ~np.isin(tb, excluded)
+        out["ours_input"] = fired(ea[keep_a], log_c) and not fired(eb[keep_b], log_c)
+    return out
 
 
 def run(

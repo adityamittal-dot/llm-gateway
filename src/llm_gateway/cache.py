@@ -135,9 +135,11 @@ class RedisCacheStore:
 class Embedder:
     """OpenAI-compatible /embeddings client (Ollama with nomic-embed-text by default)."""
 
-    def __init__(self, base_url: str, model: str, client: httpx.AsyncClient | None = None):
+    def __init__(
+        self, base_url: str, model: str, client: httpx.AsyncClient | None = None, timeout_s: float = 10.0
+    ):
         self.model = model
-        self.client = client or httpx.AsyncClient(base_url=base_url, timeout=10)
+        self.client = client or httpx.AsyncClient(base_url=base_url, timeout=timeout_s)
 
     async def embed(self, texts: list[str]) -> np.ndarray:
         resp = await self.client.post("/embeddings", json={"model": self.model, "input": texts})
@@ -234,6 +236,12 @@ def replay_as_chunks(response: dict) -> list[dict]:
         piece = word + (" " if i < len(words) - 1 else "")
         if piece:
             chunks.append(base | {"choices": [{"index": 0, "delta": {"content": piece}}]})
+    tool_calls = choice["message"].get("tool_calls") or []
+    if tool_calls:  # one delta carrying every call, in the streaming shape (with an index each)
+        deltas = [
+            {"index": i, **{k: v for k, v in c.items() if k != "index"}} for i, c in enumerate(tool_calls)
+        ]
+        chunks.append(base | {"choices": [{"index": 0, "delta": {"tool_calls": deltas}}]})
     chunks.append(
         base | {"choices": [{"index": 0, "delta": {}, "finish_reason": choice.get("finish_reason")}]}
     )

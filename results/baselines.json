@@ -1,0 +1,7 @@
+{
+  "experiment": "baselines",
+  "recordings": "data/recordings",
+  "reps": 60,
+  "n_cal": 30,
+  "length": 20000
+}

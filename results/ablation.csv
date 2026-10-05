@@ -1,0 +1,50 @@
+signals,fault,severity,detected,false_alarm_before_change,median_delay,mean_delay
+length,drop_system,0.3,1.0,0.0,139.0,180.55
+length,truncate_context,0.3,0.9833333333333333,0.016666666666666666,196.0,267.54237288135596
+length,sampling,0.3,0.5,0.0,1562.5,1449.6666666666667
+length,output_cap,0.3,1.0,0.0,56.5,77.28333333333333
+length,quant_swap,0.3,1.0,0.0,76.0,82.45
+length,model_substitution,0.3,0.6833333333333333,0.016666666666666666,920.0,1192.3658536585365
+length,throttle,0.3,0.016666666666666666,0.0,2980.0,2980.0
+tools,drop_system,0.3,0.0,0.0,,
+tools,truncate_context,0.3,0.0,0.0,,
+tools,sampling,0.3,0.0,0.0,,
+tools,output_cap,0.3,0.0,0.0,,
+tools,quant_swap,0.3,0.65,0.0,1108.0,1231.128205128205
+tools,model_substitution,0.3,0.0,0.0,,
+tools,throttle,0.3,0.0,0.0,,
+refusal,drop_system,0.3,0.0,0.0,,
+refusal,truncate_context,0.3,0.0,0.0,,
+refusal,sampling,0.3,0.0,0.0,,
+refusal,output_cap,0.3,0.0,0.0,,
+refusal,quant_swap,0.3,0.0,0.0,,
+refusal,model_substitution,0.3,0.0,0.0,,
+refusal,throttle,0.3,0.0,0.0,,
+repetition,drop_system,0.3,0.016666666666666666,0.0,1846.0,1846.0
+repetition,truncate_context,0.3,0.016666666666666666,0.0,2907.0,2907.0
+repetition,sampling,0.3,0.0,0.0,,
+repetition,output_cap,0.3,0.0,0.0,,
+repetition,quant_swap,0.3,1.0,0.0,114.5,162.78333333333333
+repetition,model_substitution,0.3,0.016666666666666666,0.0,2744.0,2744.0
+repetition,throttle,0.3,0.0,0.0,,
+latency,drop_system,0.3,0.65,0.35,400.0,490.02564102564105
+latency,truncate_context,0.3,0.6,0.38333333333333336,368.5,642.6666666666666
+latency,sampling,0.3,0.6833333333333333,0.31666666666666665,193.0,290.4878048780488
+latency,output_cap,0.3,0.6166666666666667,0.38333333333333336,183.0,266.2432432432432
+latency,quant_swap,0.3,0.6333333333333333,0.36666666666666664,347.5,355.5
+latency,model_substitution,0.3,0.7,0.3,32.0,32.714285714285715
+latency,throttle,0.3,0.6333333333333333,0.36666666666666664,229.5,321.55263157894734
+quality (all content),drop_system,0.3,1.0,0.0,673.0,900.4
+quality (all content),truncate_context,0.3,0.7,0.0,1168.0,1319.5238095238096
+quality (all content),sampling,0.3,0.11666666666666667,0.0,1681.0,1487.857142857143
+quality (all content),output_cap,0.3,1.0,0.0,315.0,453.18333333333334
+quality (all content),quant_swap,0.3,1.0,0.0,34.5,46.75
+quality (all content),model_substitution,0.3,0.2,0.0,1611.0,1407.5
+quality (all content),throttle,0.3,0.0,0.0,,
+all incl. latency,drop_system,0.3,0.8666666666666667,0.13333333333333333,117.5,133.98076923076923
+all incl. latency,truncate_context,0.3,0.85,0.15,139.0,176.0
+all incl. latency,sampling,0.3,0.8333333333333334,0.16666666666666666,184.0,332.18
+all incl. latency,output_cap,0.3,0.8333333333333334,0.16666666666666666,49.5,62.36
+all incl. latency,quant_swap,0.3,0.95,0.05,38.0,42.68421052631579
+all incl. latency,model_substitution,0.3,0.8833333333333333,0.11666666666666667,23.0,27.28301886792453
+all incl. latency,throttle,0.3,0.9166666666666666,0.08333333333333333,706.0,878.0363636363636
