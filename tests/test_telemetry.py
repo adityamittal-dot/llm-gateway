@@ -28,7 +28,7 @@ def test_metrics_and_genai_spans():
     spans = {s.name: s for s in exporter.get_finished_spans()}
     root, attempt = spans["chat m"], spans["provider fake"]
     assert attempt.parent.span_id == root.context.span_id
-    assert root.attributes["gen_ai.system"] == "fake" and root.attributes["gen_ai.usage.output_tokens"] == 1
+    assert root.attributes["gen_ai.system"] == "fake" and root.attributes["gen_ai.usage.output_tokens"] == 5
 
 
 def test_root_span_ends_when_the_handler_crashes():

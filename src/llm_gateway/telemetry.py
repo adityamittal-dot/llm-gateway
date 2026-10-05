@@ -61,6 +61,14 @@ class Metrics:
             "gateway_time_to_first_token", unit="s", description="Streaming TTFT"
         )
         self.breaker_states: dict[str, int] = {}
+        self.quality_levels: dict[str, int] = {}
+        meter.create_observable_gauge(
+            "gateway_quality_level",
+            callbacks=[
+                lambda _o: [metrics.Observation(v, {"provider": p}) for p, v in self.quality_levels.items()]
+            ],
+            description="Quality breaker level per provider (0 healthy, 1 alert, 2 shift, 3 open)",
+        )
         meter.create_observable_gauge(
             "gateway_breaker_open",
             callbacks=[self._breaker_cb],

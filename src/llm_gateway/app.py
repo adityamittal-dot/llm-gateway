@@ -35,10 +35,13 @@ from llm_gateway.config import Settings, hash_key
 from llm_gateway.db import LedgerWriter, ensure_partitions, load_prices, make_engine
 from llm_gateway.faults import FaultInjector, parse_faults
 from llm_gateway.pricing import Pricing
+from llm_gateway.promptcache import CacheBreakDetector
 from llm_gateway.providers import ErrorKind, Provider, ProviderError, Registry, build_provider
 from llm_gateway.providers.openai_compat import OpenAICompatProvider
+from llm_gateway.quality import QualityConfig, QualityMonitor
 from llm_gateway.ratelimit import Limiter, MemoryLimitStore, RedisLimitStore, estimate_tokens
 from llm_gateway.retries import Retrier, RetryPolicy
+from llm_gateway.sessions import MemorySessionStore, RedisSessionStore, Sessions
 from llm_gateway.signal_log import SignalLog
 from llm_gateway.telemetry import get_metrics, prometheus_payload, tracer
 
@@ -64,6 +67,10 @@ def provider_error_response(err: ProviderError, headers: dict | None = None) -> 
 def bearer_token(request: Request) -> str | None:
     auth = request.headers.get("authorization", "")
     return auth[7:].strip() if auth.lower().startswith("bearer ") else None
+
+
+def target_model_of(applied) -> str:
+    return str(applied.body.get("model", ""))
 
 
 def sse(data: dict | str) -> bytes:
@@ -101,6 +108,12 @@ def create_app(
         app.state.limiter = Limiter(limit_store, settings.tenants, settings.teams, settings.orgs)
         app.state.pricing = Pricing.from_config(settings.prices)
         app.state.metrics = get_metrics()
+        app.state.quality = QualityMonitor(QualityConfig.from_config(settings.quality))
+        app.state.cache_breaks = CacheBreakDetector()
+        session_store = (
+            RedisSessionStore(app.state.redis) if app.state.redis is not None else MemorySessionStore()
+        )
+        app.state.sessions = Sessions(session_store, settings.tenants)
         cache_cfg = CacheConfig.from_config(settings.cache)
         app.state.embedder = embedder or Embedder(cache_cfg.embedding_base_url, cache_cfg.embedding_model)
         cache_store = RedisCacheStore(app.state.redis) if app.state.redis is not None else MemoryCacheStore()
@@ -162,6 +175,16 @@ def create_app(
         require_admin(x_admin_key)
         return await request.app.state.breaker.snapshot(list(request.app.state.registry.providers))
 
+    @app.get("/admin/quality")
+    async def get_quality(request: Request, x_admin_key: str | None = Header(None)) -> dict:
+        require_admin(x_admin_key)
+        return request.app.state.quality.snapshot()
+
+    @app.get("/admin/cache-breaks")
+    async def get_cache_breaks(request: Request, x_admin_key: str | None = Header(None)) -> list[dict]:
+        require_admin(x_admin_key)
+        return list(request.app.state.cache_breaks.events)
+
     @app.get("/metrics")
     async def metrics_endpoint() -> Response:
         payload, content_type = prometheus_payload()
@@ -205,6 +228,14 @@ def create_app(
                  "cache_status": f"hit-{hit.kind}", "failovers": 0,
                  "finish_reason": response["choices"][0].get("finish_reason"), "quality": {"saved_usd": saved}}
             )  # fmt: skip
+        tool_calls = response["choices"][0].get("message", {}).get("tool_calls") or []
+        if await request.app.state.sessions.after_response(
+            tenant, request.headers.get("x-session-id"), 0.0, tool_calls
+        ):
+            log.warning(
+                "agent_loop_detected",
+                extra={"tenant": tenant, "session_id": request.headers.get("x-session-id")},
+            )
         if not body.get("stream"):
             return JSONResponse(response, headers=headers)
 
@@ -251,6 +282,13 @@ def create_app(
                 "invalid_request_error",
                 "model_not_found",
             )
+
+        # Session controls come first: a looping agent re-sending an identical request must be stopped
+        # even when the answer would come from the cache.
+        session_id = request.headers.get("x-session-id")
+        if blocked := await request.app.state.sessions.admit(tenant, session_id):
+            request.app.state.metrics.rate_limited.add(1, {"tenant": tenant, "reason": blocked[0]})
+            return openai_error(429, blocked[1], "rate_limit_exceeded", blocked[0])
 
         # Cache before limits: a hit costs no provider tokens, so it is not rate limited or charged.
         cache: ResponseCache = request.app.state.cache
@@ -309,6 +347,16 @@ def create_app(
             if len(attempts) > 1 or any(a["outcome"] != "ok" for a in attempts):
                 signals.extra["attempts"] = attempts
             request.app.state.signal_log.append(signals)
+            quality: QualityMonitor = request.app.state.quality
+            if applied is not None:  # a real provider response (not "every provider failed")
+                quality.observe(provider.name, tenant, signals)
+                request.app.state.metrics.quality_levels[provider.name] = quality.providers[
+                    provider.name
+                ].level
+                if event := request.app.state.cache_breaks.observe(
+                    tenant, target_model_of(applied), applied.body, usage
+                ):
+                    log.warning("cache_break", extra=event)
             # Settle the token reservation (refund the unused estimate) and charge the spend.
             actual = (usage or {}).get("total_tokens") or (
                 ((usage or {}).get("prompt_tokens") or 0) + ((usage or {}).get("completion_tokens") or 0)
@@ -354,6 +402,9 @@ def create_app(
             if finish_reason:
                 span.set_attribute("gen_ai.response.finish_reasons", [finish_reason])
             span.end()
+            tool_calls = (message or {}).get("tool_calls") or []
+            if await request.app.state.sessions.after_response(tenant, session_id, cost, tool_calls):
+                log.warning("agent_loop_detected", extra={"tenant": tenant, "session_id": session_id})
             for scope, spent, soft in await limiter.add_spend(tenant, cost):
                 log.warning("soft_budget_exceeded", extra={"scope": scope, "spent_usd": round(spent, 6),
                                                            "soft_budget_usd": soft})  # fmt: skip
@@ -393,11 +444,15 @@ def create_app(
         # errors, never on a bad request (it would fail everywhere). Streams can only fail over
         # before the first chunk, which is why the first chunk is fetched here.
         last_error: ProviderError | None = None
-        for provider, target in candidates:
+        quality_monitor: QualityMonitor = request.app.state.quality
+        for index, (provider, target) in enumerate(candidates):
+            if not quality_monitor.admit(provider.name, has_fallback=index < len(candidates) - 1):
+                attempts.append({"provider": provider.name, "outcome": "quality_shift"})
+                continue
             if not await breaker.allow(provider.name):
                 attempts.append({"provider": provider.name, "outcome": "breaker_open"})
                 continue
-            applied = request.app.state.faults.apply({**body, "model": target})
+            applied = request.app.state.faults.apply({**body, "model": target}, provider.name)
             attempt_ctx = trace.set_span_in_context(span)
             try:
                 with tracer.start_as_current_span(
