@@ -16,3 +16,12 @@ providers:
   # Amazon Bedrock on AWS credits (uses your AWS CLI credentials; enable model access in the console).
   - {name: bedrock, type: bedrock, region: us-east-1,
      models: {nova-micro: us.amazon.nova-micro-v1:0, nova-lite: us.amazon.nova-lite-v1:0}}
+# Fallback chains: a model alias tried in order; providers with an open breaker are skipped.
+routes:
+  chat-default:
+    - {provider: bedrock, model: nova-micro}
+    - {provider: groq, model: llama-3.1-8b-instant}
+    - {provider: ollama, model: "qwen2.5:1.5b-instruct-q8_0"}
+breaker: {window_s: 60, min_requests: 5, failure_ratio: 0.5, cooldown_s: 30}
+retry: {max_attempts: 3, base_delay_s: 0.2, max_delay_s: 2.0}
+# redis_url: redis://localhost:6379/0   # share breaker state across gateway processes
