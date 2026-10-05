@@ -7,3 +7,4 @@ dist/
 data/
 results/raw/
 .env
+config/gateway.yaml

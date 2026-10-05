@@ -33,8 +33,23 @@ LLAMA = "llama3.2:1b-instruct-q8_0"
 TENANTS = ["math", "chat", "code", "tools"]
 
 
-def condition(provider: str, model: str, fault: dict | None = None, shifted: tuple[str, ...] = ()) -> dict:
-    return {"provider": provider, "model": model, "faults": [fault] if fault else [], "shifted": shifted}
+def condition(
+    provider: str, model: str, fault: dict | None = None, shifted: tuple[str, ...] = (), providers=None
+) -> dict:
+    cond = {"provider": provider, "model": model, "faults": [fault] if fault else [], "shifted": shifted}
+    return cond | ({"providers": providers} if providers else {})
+
+
+# Amazon Bedrock (needs AWS credentials + model access): faults 1-5 only, quantization is not controllable.
+NOVA = "nova-micro"
+BEDROCK = [
+    {
+        "name": "bedrock-nova",
+        "type": "bedrock",
+        "region": "us-east-1",
+        "models": {NOVA: "us.amazon.nova-micro-v1:0", "nova-lite": "us.amazon.nova-lite-v1:0"},
+    }
+]
 
 
 # Provider A = Qwen 1.5B (faults injected here); provider B = Llama 3.2 1B (the control provider).
@@ -58,7 +73,25 @@ CONDITIONS = {
     # Traffic shift: the chat and math tenants change their own prompts; seen on both providers.
     "qwen_shifted": condition("ollama-qwen", QWEN, shifted=("chat", "math")),
     "llama_shifted": condition("ollama-llama", LLAMA, shifted=("chat", "math")),
+    "nova_healthy": condition("bedrock-nova", NOVA, providers=BEDROCK),
+    "nova_drop_system": condition("bedrock-nova", NOVA, {"name": "drop_system"}, providers=BEDROCK),
+    "nova_truncate_context": condition(
+        "bedrock-nova", NOVA, {"name": "truncate_context", "params": {"tokens": 32}}, providers=BEDROCK
+    ),
+    "nova_sampling": condition(
+        "bedrock-nova", NOVA, {"name": "sampling", "params": {"temperature": 1.0}}, providers=BEDROCK
+    ),
+    "nova_output_cap": condition(
+        "bedrock-nova", NOVA, {"name": "output_cap", "params": {"max_tokens": 48}}, providers=BEDROCK
+    ),
+    "nova_model_substitution": condition(
+        "bedrock-nova",
+        NOVA,
+        {"name": "model_substitution", "params": {"model": "nova-lite"}},
+        providers=BEDROCK,
+    ),
 }
+LOCAL_CONDITIONS = [name for name, cond in CONDITIONS.items() if "providers" not in cond]
 
 
 def stable_coin(key: str) -> bool:
@@ -109,7 +142,9 @@ async def send(client: httpx.AsyncClient, item: Item, model: str, key: str, repl
 def start_gateway(out: Path, cond: dict, port: int) -> subprocess.Popen:
     keys = [{"key": f"sk-{t}", "tenant": t} for t in TENANTS]
     cfg = out / "gateway.yaml"
-    cfg.write_text(yaml.safe_dump({"keys": keys, "faults": cond["faults"]}))
+    cfg.write_text(
+        yaml.safe_dump({"keys": keys, "faults": cond["faults"], "providers": cond.get("providers", [])})
+    )
     env = os.environ | {
         "GATEWAY_CONFIG": str(cfg),
         "SIGNAL_DIR": str(out / "signals"),
@@ -177,7 +212,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--conditions", default=",".join(CONDITIONS), help="comma-separated condition names")
+    parser.add_argument(
+        "--conditions", default=",".join(LOCAL_CONDITIONS), help="comma-separated names (default: local ones)"
+    )
     parser.add_argument("--n", type=int, default=150, help="requests per tenant")
     parser.add_argument("--out", type=Path, default=Path("data/recordings"))
     parser.add_argument("--concurrency", type=int, default=4)

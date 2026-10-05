@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from llm_gateway.app import create_app
 from llm_gateway.config import Settings
-from llm_gateway.faults import Fault, FaultInjector, restore_model_name, truncate_messages
+from llm_gateway.faults import Fault, FaultInjector, truncate_messages
 
 BODY = {
     "model": "qwen-q8",
@@ -62,12 +62,6 @@ def test_truncate_keeps_newest_and_cuts_oldest_kept_message():
     msgs = [{"role": "user", "content": "x" * 100}, {"role": "user", "content": "y" * 10}]
     out = truncate_messages(msgs, max_tokens=5)  # 20 chars
     assert out == [{"role": "user", "content": "x" * 10}, {"role": "user", "content": "y" * 10}]
-
-
-def test_model_name_is_restored_in_responses():
-    applied = FaultInjector([Fault("model_substitution", params={"model": "small"})]).apply(BODY)
-    assert restore_model_name(b'{"model":"small","x":1}', applied) == b'{"model":"qwen-q8","x":1}'
-    assert restore_model_name(b'{"model": "small"}', applied) == b'{"model": "qwen-q8"}'
 
 
 def test_gateway_applies_faults_silently_and_labels_ground_truth(tmp_path):

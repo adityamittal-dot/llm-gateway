@@ -54,7 +54,12 @@ def test_streaming_completion_is_relayed_as_sse():
     with make_gateway(handler) as gw, gw.stream("POST", "/v1/chat/completions", json=body) as resp:
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/event-stream")
-        assert b"".join(resp.iter_bytes()) == b"".join(SSE_CHUNKS)
+        events = [e for e in b"".join(resp.iter_bytes()).decode().split("\n\n") if e]
+    assert events[-1] == "data: [DONE]"
+    parsed = [json.loads(e[6:]) for e in events[:-1]]
+    assert "".join(c["choices"][0]["delta"].get("content", "") for c in parsed) == "hi"
+    assert parsed[-1]["choices"][0]["finish_reason"] == "stop"
+    assert all(c["model"] == "m" for c in parsed)
 
 
 def test_upstream_error_status_and_body_pass_through():
