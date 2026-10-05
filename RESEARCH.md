@@ -2,7 +2,7 @@
 
 Working title: **"Silent Failures Return 200: Detecting and Attributing Provider Degradation at the LLM Gateway"**
 
-This file holds the research topic, the plan, the 2-week sprint, and the route to publication. The README describes the full gateway product. This file covers only the part that becomes a paper.
+This file holds the research topic, the plan, the research sprint, and the route to publication. The README describes the full gateway product. This file covers only the part that becomes a paper.
 
 ---
 
@@ -127,34 +127,19 @@ Generating responses is the expensive part, so each (provider, fault, severity, 
 
 This is valid here (unlike the agent-routing case in the Replay Gap) because each request is independent: the fault doesn't change which requests arrive next. Some live end-to-end runs confirm the replay results.
 
-## 10. The 2-week sprint
+## 10. The research sprint (days 1–11 of the 3-week plan)
 
-**Goal:** a go/no-go answer. Do passive signals detect injected faults fast, with few false alarms, and does cross-tenant attribution work in a toy setting? Roughly 2–3 hours per day.
+The research work is part of the 3-week build plan in [PLAN.md](PLAN.md):
 
-### Week 1: build the pipeline and data
+| Days | Research work |
+|---|---|
+| 1 ✅ | Ollama + quantized models, passthrough gateway (`src/llm_gateway`), smoke test |
+| 2–3 | Signal extractor; fault proxy (faults 1–7) |
+| 4–7 | Tenant replayer; healthy and faulty recordings (overnight on the local GPU), then Bedrock recordings for faults 1–5 |
+| 8–10 | Splicer + evaluation harness; baselines; e-process detector with pooling; attribution experiment; signal ablation |
+| 11 | Go/no-go memo with 3 plots in `results/memo.md` |
 
-| Day | Task | Done when |
-|---|---|---|
-| 1 | **Phase 1 start.** Install Ollama and pull 2 small models in 2 quantizations each. Scaffold the repo (`uv`, FastAPI, `src/gateway`). Write a passthrough `POST /v1/chat/completions` to Ollama's OpenAI-compatible endpoint, with streaming | The OpenAI Python SDK works against `localhost` with only `base_url` changed |
-| 2 | Signal extractor: compute the section 6 signals per response and append to a JSONL/Parquet log with tenant, provider and timestamp | Every proxied response produces one signal row |
-| 3 | Fault proxy: faults 1–5 and 7 as middleware toggled by config; fault 6 by switching the Ollama tag | Each fault is visible in a manual test |
-| 4 | Tenant replayer: load 2–4 datasets, send requests at a fixed rate, tag the tenant | A 500-request run per tenant completes overnight |
-| 5 | Bedrock adapter (Converse) for one cheap model, behind the same interface; set the AWS budget alarms first | The same replayer runs against Bedrock |
-| 6–7 | **Data collection:** healthy and faulty recordings for each (provider, fault, severity, tenant) on Ollama, plus a smaller Bedrock set for faults 1–5 | Recordings saved, with a short data card (counts, settings) |
-
-### Week 2: detectors, experiments, decision
-
-| Day | Task | Done when |
-|---|---|---|
-| 8 | Splicer + evaluation harness: build healthy→faulty streams at random τ; compute ARL₀ and CADD | Harness runs on fake data |
-| 9 | Baselines: HTTP-error breaker (expected to catch nothing), fixed thresholds per signal, per-signal CUSUM | First delay vs false-alarm numbers |
-| 10 | Main detector: e-process per stream plus pooling across tenants | Its delay curve sits alongside the baselines |
-| 11 | Attribution experiment: tenant shift only / provider fault only / both, with a control provider | Confusion matrix of "provider vs traffic" calls |
-| 12 | Signal ablation: which signals catch which faults | Heatmap of fault × signal |
-| 13 | **Results notebook and 3 plots:** (a) delay vs false-alarm curve, (b) attribution matrix, (c) ablation heatmap | Plots committed under `results/` |
-| 14 | Write a 2-page results memo (problem, setup, plots, what worked and what didn't) and make the go/no-go call | `results/memo.md` committed |
-
-### Go/no-go criteria (day 14)
+### Go/no-go criteria (day 11)
 
 - **Go** if at least 3 fault types are detected well before 1,000 requests at under 1 false alarm per 10k healthy requests, **and** the attribution test beats per-tenant monitoring. Then continue with section 11.
 - **Partial** if detection works but attribution doesn't. A detection-only paper is still a workshop paper; attribution becomes future work.
@@ -190,7 +175,7 @@ This is valid here (unlike the agent-routing case in the Replay Gap) because eac
    - Check the target venue's preprint/anonymity policy first.
 2. **Workshop first** (4–6 pages): ML-systems or reliability workshops at NeurIPS, ICML or ICLR, or EuroMLSys. Submission is free at reputable CS venues, and review is usually double-blind (anonymize the repo link). Prefer **non-archival** workshops so the work can grow into a conference paper.
 3. **Conference later** (extended version): MLSys, SoCC, Middleware, USENIX ATC. Check current deadlines.
-4. **Find a mentor early:** email one or two researchers in ML systems or sequential testing a one-page summary plus the day-14 plots.
+4. **Find a mentor early:** email one or two researchers in ML systems or sequential testing a one-page summary plus the day-11 plots.
 
 | Item | Cost |
 |---|---|
@@ -209,7 +194,7 @@ This is valid here (unlike the agent-routing case in the Replay Gap) because eac
 |---|---|
 | Small local models behave unlike frontier APIs | Repeat the core result on Bedrock with faults 1–5; state the limitation |
 | Signals too noisy at low traffic | Report the minimum traffic needed; pooling across tenants is the point |
-| Someone publishes the same idea first | Re-check literature at day 14 and before writing; lean on attribution, which is the hardest part to copy |
+| Someone publishes the same idea first | Re-check literature at day 11 and before writing; lean on attribution, which is the hardest part to copy |
 | Free-tier rate limits | Use free tiers only for baselines and small studies; main data comes from the local GPU |
 | AWS credits don't cover a chosen model or instance | Check the credit terms first; default to Amazon Nova on Bedrock and spot instances |
 | Scope creep into the full gateway | Phase 0 builds only proxy + signals + fault proxy + detectors. The AWS stack waits |

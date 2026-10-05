@@ -1,0 +1,35 @@
+[project]
+name = "llm-gateway"
+version = "0.1.0"
+description = "Provider-agnostic LLM gateway with a quality circuit breaker"
+authors = [
+    { name = "adityamittal-dot", email = "adityamittal529@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.142.2",
+    "httpx>=0.28.1",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[project.scripts]
+llm-gateway = "llm_gateway:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "anyio>=4.15.1",
+    "openai>=3.24.0",
+    "pytest>=9.1.1",
+    "ruff>=0.16.10",
+]
+
+[tool.ruff]
+line-length = 110
+extend-exclude = ["*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -2,7 +2,18 @@
 
 A self-built, provider-agnostic gateway that routes, caches, secures and meters every LLM call an application makes — instead of apps hitting Bedrock, Anthropic or OpenAI directly. Apps keep using the OpenAI (or Anthropic) SDK they already have and only change `base_url`.
 
-> **Status:** design phase — this README is the plan; Phase 1 has not started.
+> **Status:** building, on a 3-week plan ([PLAN.md](PLAN.md)). Done so far: OpenAI-compatible passthrough gateway with streaming (day 1). Most of this README is still the design.
+
+## Quickstart (current state)
+
+```bash
+# Upstream: a local Ollama server (default http://localhost:11434/v1; override with UPSTREAM_BASE_URL)
+ollama pull qwen2.5:1.5b-instruct-q8_0
+uv sync
+uv run llm-gateway                 # serves http://127.0.0.1:8000
+uv run python scripts/smoke.py     # stock OpenAI SDK, only base_url changed
+uv run pytest                      # tests use a fake upstream; no Ollama needed
+```
 
 Built to demonstrate real distributed-systems infra skills (token-aware rate limiting, semantic caching with measured correctness, circuit breaking, multi-provider failover, cost/latency observability), not just "call an LLM API". The headline feature is a **quality circuit breaker**: the gateway notices when a provider starts returning worse answers with `200 OK`, works out whether the provider or the traffic changed, and fails over with a bounded false-alarm rate.
 
@@ -290,10 +301,10 @@ infra/
 
 Each phase ends with something demoable.
 
-### Phase 0 — Research sprint (2 weeks, current)
+### Phase 0 — Research sprint (days 1–11, current)
 - Local-only: a minimal proxy, per-response quality signals, a fault proxy, and detectors. Uses local Ollama models, Amazon Bedrock on AWS credits, and free-tier APIs; no always-on AWS infrastructure.
-- **Done when:** the day-14 go/no-go memo exists. Full plan, sprint schedule and publishing route: [RESEARCH.md](RESEARCH.md)
-- Phases 1–7 below proceed after a "go", reusing the sprint's proxy as Phase 1's starting point.
+- **Done when:** the day-11 go/no-go memo exists. Research details and publishing route: [RESEARCH.md](RESEARCH.md)
+- **All phases run on a 3-week schedule (5–25 Oct 2026), each at MVP depth:** see [PLAN.md](PLAN.md) for the day-by-day plan and what is deferred.
 
 ### Phase 1 — Core path
 - FastAPI service with OpenAI-compatible `/v1/chat/completions`, Bedrock adapter (Converse), SSE streaming
