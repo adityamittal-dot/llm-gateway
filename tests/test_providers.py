@@ -36,6 +36,7 @@ class FakeProvider:
             fail_after,
         )
         self.bodies = []
+        self.finish = "stop"
 
     def serves(self, model):
         return "*" in self.models or model in self.models
@@ -46,8 +47,10 @@ class FakeProvider:
             raise self.error
         return {
             "model": "upstream-name",
-            "choices": [{"message": {"role": "assistant", "content": self.reply}, "finish_reason": "stop"}],
-            "usage": {"completion_tokens": 1},
+            "choices": [
+                {"message": {"role": "assistant", "content": self.reply}, "finish_reason": self.finish}
+            ],
+            "usage": {"completion_tokens": len(self.reply)},
         }
 
     async def stream(self, body):

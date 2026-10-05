@@ -1,0 +1,7 @@
+1. warm-up (reference learned)     served_by={'primary': 80}  http={200: 80}  quality_level=0  http_breaker=closed
+2. healthy traffic                 served_by={'primary': 40}  http={200: 40}  quality_level=0  http_breaker=closed
+3. silent fault on primary         served_by={'primary': 18, 'backup': 22}  http={200: 40}  quality_level=3  http_breaker=closed
+4. fault continues                 served_by={'backup': 33, 'primary': 7}  http={200: 40}  quality_level=3  http_breaker=closed
+5. primary fixed (canaries)        served_by={'backup': 81, 'primary': 119}  http={200: 200}  quality_level=0  http_breaker=closed
+6. after recovery                  served_by={'primary': 40}  http={200: 40}  quality_level=0  http_breaker=closed
+level changes: [('primary', 0, 1), ('primary', 1, 3), ('primary', 3, 0)]

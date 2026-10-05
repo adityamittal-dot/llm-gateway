@@ -78,4 +78,4 @@ def test_gateway_writes_one_ledger_row_per_request(postgres_url):
     result = asyncio.run(rows())
     assert [(r.tenant, r.session_id, r.stream, r.status) for r in result] == [
         ("acme", "run-42", False, 200), ("acme", "run-42", True, 200)]  # fmt: skip
-    assert float(result[0].cost_usd) == 2.0 / 1e6  # one completion token at $2 per million
+    assert float(result[0].cost_usd) == 5 * 2.0 / 1e6  # five completion tokens ("hello") at $2 per million

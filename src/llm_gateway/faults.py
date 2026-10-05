@@ -36,6 +36,7 @@ class Fault:
     name: str
     p: float = 1.0
     params: dict[str, Any] = field(default_factory=dict)
+    provider: str | None = None  # only requests to this provider (None = every provider)
 
     def __post_init__(self) -> None:
         if self.name not in FAULTS:
@@ -65,9 +66,11 @@ class FaultInjector:
     def set(self, faults: list[Fault]) -> None:
         self.faults = list(faults)
 
-    def apply(self, body: dict) -> Applied:
-        """Apply at most one fault: the first configured fault whose coin flip lands."""
+    def apply(self, body: dict, provider: str | None = None) -> Applied:
+        """Apply at most one fault: the first configured fault for this provider whose coin flip lands."""
         for fault in self.faults:
+            if fault.provider not in (None, provider):
+                continue
             if self._rng.random() < fault.p:
                 return _apply_one(fault, copy.deepcopy(body))
         return Applied(body=body)
@@ -118,5 +121,11 @@ def truncate_messages(messages: list[dict], max_tokens: int) -> list[dict]:
 
 def parse_faults(raw: list[dict] | None) -> list[Fault]:
     return [
-        Fault(name=f["name"], p=float(f.get("p", 1.0)), params=dict(f.get("params") or {})) for f in raw or []
+        Fault(
+            name=f["name"],
+            p=float(f.get("p", 1.0)),
+            params=dict(f.get("params") or {}),
+            provider=f.get("provider"),
+        )
+        for f in raw or []
     ]

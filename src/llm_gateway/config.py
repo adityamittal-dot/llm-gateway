@@ -71,6 +71,8 @@ class Settings:
     database_url: str | None = None
     # Response cache (cache.CacheConfig fields).
     cache: dict = field(default_factory=dict)
+    # Quality circuit breaker (quality.QualityConfig fields).
+    quality: dict = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -100,6 +102,7 @@ class Settings:
             prices=dict(file_cfg.get("prices") or {}),
             database_url=os.environ.get("DATABASE_URL") or file_cfg.get("database_url"),
             cache=dict(file_cfg.get("cache") or {}),
+            quality=dict(file_cfg.get("quality") or {}),
         )
 
     def provider_configs(self) -> list[dict]:
