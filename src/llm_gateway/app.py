@@ -22,8 +22,10 @@ from llm_gateway import signals as sig
 from llm_gateway.breaker import BreakerConfig, CircuitBreaker, MemoryStore, RedisStore
 from llm_gateway.config import Settings, hash_key
 from llm_gateway.faults import FaultInjector, parse_faults
+from llm_gateway.pricing import Pricing
 from llm_gateway.providers import ErrorKind, Provider, ProviderError, Registry, build_provider
 from llm_gateway.providers.openai_compat import OpenAICompatProvider
+from llm_gateway.ratelimit import Limiter, MemoryLimitStore, RedisLimitStore, estimate_tokens
 from llm_gateway.retries import Retrier, RetryPolicy
 from llm_gateway.signal_log import SignalLog
 
@@ -81,6 +83,9 @@ def create_app(
         app.state.redis = redis_client or (redis_from_url(settings.redis_url) if settings.redis_url else None)
         store = RedisStore(app.state.redis) if app.state.redis is not None else MemoryStore()
         app.state.breaker = CircuitBreaker(store, BreakerConfig.from_config(settings.breaker))
+        limit_store = RedisLimitStore(app.state.redis) if app.state.redis is not None else MemoryLimitStore()
+        app.state.limiter = Limiter(limit_store, settings.tenants, settings.teams, settings.orgs)
+        app.state.pricing = Pricing.from_config(settings.prices)
         app.state.signal_log = SignalLog(settings.signal_dir)
         app.state.signal_log.start()
         app.state.regenerates = sig.RegenerateTracker()
@@ -158,6 +163,20 @@ def create_app(
                 "model_not_found",
             )
 
+        limiter: Limiter = request.app.state.limiter
+        if scope := await limiter.over_budget(tenant):
+            return openai_error(
+                429, f"Monthly budget exhausted for {scope}.", "budget_exceeded", "budget_exceeded"
+            )
+        reservation, wait_ms = await limiter.reserve(tenant, estimate_tokens(body))
+        if reservation is None:
+            if wait_ms < 0:
+                return openai_error(429, "Request is larger than the token-per-minute limit.", "rate_limit_exceeded",
+                                    "request_too_large")  # fmt: skip
+            resp = openai_error(429, "Rate limit exceeded.", "rate_limit_exceeded", "rate_limit_exceeded")
+            resp.headers["Retry-After"] = str(max(1, -(-wait_ms // 1000)))
+            return resp
+
         request_id = uuid.uuid4().hex
         headers = {"X-Request-Id": request_id}
         common = {
@@ -171,8 +190,8 @@ def create_app(
         retrier: Retrier = request.app.state.retrier
         attempts: list[dict] = []  # one entry per provider tried, for logs and the signal row
 
-        def record(provider: Provider, applied, status: int, first_token_at=None, message=None,
-                   finish_reason=None, usage=None) -> None:  # fmt: skip
+        async def record(provider: Provider, applied, status: int, first_token_at=None, message=None,
+                         finish_reason=None, usage=None) -> None:  # fmt: skip
             signals = sig.extract(
                 provider=provider.name,
                 status_code=status,
@@ -187,6 +206,16 @@ def create_app(
             if len(attempts) > 1 or any(a["outcome"] != "ok" for a in attempts):
                 signals.extra["attempts"] = attempts
             request.app.state.signal_log.append(signals)
+            # Settle the token reservation (refund the unused estimate) and charge the spend.
+            actual = (usage or {}).get("total_tokens") or (
+                ((usage or {}).get("prompt_tokens") or 0) + ((usage or {}).get("completion_tokens") or 0)
+            )
+            await limiter.settle(reservation, actual if usage else 0)
+            target = applied.body.get("model", model) if applied else model
+            cost = request.app.state.pricing.cost(target, usage)
+            for scope, spent, soft in await limiter.add_spend(tenant, cost):
+                log.warning("soft_budget_exceeded", extra={"scope": scope, "spent_usd": round(spent, 6),
+                                                           "soft_budget_usd": soft})  # fmt: skip
             log.info(
                 "request",
                 extra={
@@ -201,6 +230,7 @@ def create_app(
                     "completion_tokens": signals.completion_tokens,
                     "finish_reason": finish_reason,
                     "failovers": max(0, len(attempts) - 1),
+                    "cost_usd": round(cost, 8),
                 },
             )
 
@@ -259,10 +289,10 @@ def create_app(
                 last_error = ProviderError(
                     ErrorKind.OVERLOADED, "All providers for this model are unavailable."
                 )
-            record(provider, applied, last_error.status)
+            await record(provider, applied, last_error.status)
             return provider_error_response(last_error, headers)
         if attempts[-1]["outcome"] != "ok":  # bad request: stop without failover
-            record(provider, applied, last_error.status)
+            await record(provider, applied, last_error.status)
             return provider_error_response(last_error, headers)
         headers["X-Gateway-Provider"] = provider.name
 
@@ -272,7 +302,9 @@ def create_app(
             usage = result.get("usage") or {}
             if applied.chunk_delay_s:
                 await asyncio.sleep(applied.chunk_delay_s * (usage.get("completion_tokens") or 0) / 10)
-            record(provider, applied, 200, None, choice.get("message"), choice.get("finish_reason"), usage)
+            await record(
+                provider, applied, 200, None, choice.get("message"), choice.get("finish_reason"), usage
+            )
             return JSONResponse(result, headers=headers)
 
         chunks, first = opened
@@ -303,7 +335,9 @@ def create_app(
                 }
                 yield sse({"error": error})
             finally:
-                record(provider, applied, 200, first_token_at, acc.message(), acc.finish_reason, acc.usage)
+                await record(
+                    provider, applied, 200, first_token_at, acc.message(), acc.finish_reason, acc.usage
+                )
 
         return StreamingResponse(
             relay(),

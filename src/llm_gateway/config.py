@@ -61,6 +61,12 @@ class Settings:
     routes: dict = field(default_factory=dict)
     # Shared state (breaker, rate limits, caches). Without it, state is per process.
     redis_url: str | None = None
+    # Limits and budgets per tenant (+ its team and org): {rpm, tpm, budget_usd, soft_budget_usd, team, org}.
+    tenants: dict = field(default_factory=dict)
+    teams: dict = field(default_factory=dict)
+    orgs: dict = field(default_factory=dict)
+    # USD per million tokens: {model: {input_per_mtok, output_per_mtok, cached_input_per_mtok}}.
+    prices: dict = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -84,6 +90,10 @@ class Settings:
             breaker=dict(file_cfg.get("breaker") or {}),
             routes=dict(file_cfg.get("routes") or {}),
             redis_url=os.environ.get("REDIS_URL") or file_cfg.get("redis_url"),
+            tenants=dict(file_cfg.get("tenants") or {}),
+            teams=dict(file_cfg.get("teams") or {}),
+            orgs=dict(file_cfg.get("orgs") or {}),
+            prices=dict(file_cfg.get("prices") or {}),
         )
 
     def provider_configs(self) -> list[dict]:
