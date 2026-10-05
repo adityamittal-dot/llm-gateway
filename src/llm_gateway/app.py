@@ -6,6 +6,7 @@ row of passive quality signals (signals.py) and one JSON access-log line.
 """
 
 import asyncio
+import datetime as dt
 import json
 import logging
 import time
@@ -21,6 +22,7 @@ from redis.asyncio import from_url as redis_from_url
 from llm_gateway import signals as sig
 from llm_gateway.breaker import BreakerConfig, CircuitBreaker, MemoryStore, RedisStore
 from llm_gateway.config import Settings, hash_key
+from llm_gateway.db import LedgerWriter, ensure_partitions, load_prices, make_engine
 from llm_gateway.faults import FaultInjector, parse_faults
 from llm_gateway.pricing import Pricing
 from llm_gateway.providers import ErrorKind, Provider, ProviderError, Registry, build_provider
@@ -86,6 +88,16 @@ def create_app(
         limit_store = RedisLimitStore(app.state.redis) if app.state.redis is not None else MemoryLimitStore()
         app.state.limiter = Limiter(limit_store, settings.tenants, settings.teams, settings.orgs)
         app.state.pricing = Pricing.from_config(settings.prices)
+        app.state.ledger = app.state.engine = None
+        if settings.database_url:
+            try:
+                app.state.engine = make_engine(settings.database_url)
+                await ensure_partitions(app.state.engine)
+                app.state.pricing.prices |= await load_prices(app.state.engine)  # the price table wins
+                app.state.ledger = LedgerWriter(app.state.engine)
+                app.state.ledger.start()
+            except Exception:  # the gateway still serves traffic without its ledger
+                log.exception("database unavailable; running without the usage ledger")
         app.state.signal_log = SignalLog(settings.signal_dir)
         app.state.signal_log.start()
         app.state.regenerates = sig.RegenerateTracker()
@@ -94,6 +106,10 @@ def create_app(
         try:
             yield
         finally:
+            if app.state.ledger is not None:
+                await app.state.ledger.stop()
+            if app.state.engine is not None:
+                await app.state.engine.dispose()
             await app.state.signal_log.stop()
             await app.state.registry.aclose()
             if app.state.redis is not None and redis_client is None:
@@ -213,6 +229,30 @@ def create_app(
             await limiter.settle(reservation, actual if usage else 0)
             target = applied.body.get("model", model) if applied else model
             cost = request.app.state.pricing.cost(target, usage)
+            if request.app.state.ledger is not None:
+                request.app.state.ledger.append({
+                    "ts": dt.datetime.fromtimestamp(signals.ts, dt.UTC),
+                    "request_id": request_id,
+                    "tenant": tenant,
+                    "session_id": request.headers.get("x-session-id"),
+                    "provider": provider.name,
+                    "model": model,
+                    "target_model": target,
+                    "status": status,
+                    "stream": signals.stream,
+                    "prompt_tokens": signals.prompt_tokens,
+                    "completion_tokens": signals.completion_tokens,
+                    "cached_tokens": signals.cached_tokens,
+                    "cost_usd": cost,
+                    "latency_ms": int(signals.latency_s * 1000),
+                    "ttft_ms": int(signals.ttft_s * 1000) if signals.ttft_s is not None else None,
+                    "cache_status": None,
+                    "failovers": max(0, len(attempts) - 1),
+                    "finish_reason": finish_reason,
+                    "quality": {"refusal": signals.refusal, "empty": signals.empty,
+                                "repetition": round(signals.repetition, 4), "tool_calls": signals.tool_calls,
+                                "tool_call_valid": signals.tool_call_valid},
+                })  # fmt: skip
             for scope, spent, soft in await limiter.add_spend(tenant, cost):
                 log.warning("soft_budget_exceeded", extra={"scope": scope, "spent_usd": round(spent, 6),
                                                            "soft_budget_usd": soft})  # fmt: skip
