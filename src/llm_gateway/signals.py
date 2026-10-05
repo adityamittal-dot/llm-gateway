@@ -145,6 +145,10 @@ class StreamAccumulator:
             chunk = json.loads(payload)
         except ValueError:
             return
+        self.add(chunk)
+
+    def add(self, chunk: dict) -> None:
+        """Feed one parsed `chat.completion.chunk`."""
         self.chunks += 1
         if chunk.get("usage"):
             self.usage = chunk["usage"]

@@ -1,0 +1,18 @@
+# Copy to config/gateway.yaml (gitignored) and point GATEWAY_CONFIG at it.
+require_auth: true
+admin_key: change-me
+signal_dir: data/signals
+keys:
+  # Generate a hash with: python -c "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" sk-...
+  - {key: sk-dev-local, tenant: dev}
+providers:
+  # Local models (free): any model Ollama has pulled.
+  - {name: ollama, type: openai_compat, base_url: "http://localhost:11434/v1", models: ["*"]}
+  # Free tiers (keys are YOUR lookup: set the env vars, never commit keys).
+  - {name: groq, type: openai_compat, base_url: "https://api.groq.com/openai/v1",
+     api_key_env: GROQ_API_KEY, models: [llama-3.1-8b-instant]}
+  - {name: gemini, type: openai_compat, base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+     api_key_env: GEMINI_API_KEY, models: [gemini-2.5-flash-lite]}
+  # Amazon Bedrock on AWS credits (uses your AWS CLI credentials; enable model access in the console).
+  - {name: bedrock, type: bedrock, region: us-east-1,
+     models: {nova-micro: us.amazon.nova-micro-v1:0, nova-lite: us.amazon.nova-lite-v1:0}}

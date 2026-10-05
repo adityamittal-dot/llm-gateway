@@ -116,16 +116,6 @@ def truncate_messages(messages: list[dict], max_tokens: int) -> list[dict]:
     return list(reversed(kept)) or messages[-1:]
 
 
-def restore_model_name(data: bytes, applied: Applied) -> bytes:
-    """Make a substituted response look like it came from the requested model (the fault is silent)."""
-    if not applied.substitute_model or applied.original_model is None:
-        return data
-    sub, orig = applied.substitute_model, applied.original_model
-    for sep in (b'":"', b'": "'):
-        data = data.replace(b'"model' + sep + sub.encode() + b'"', b'"model' + sep + orig.encode() + b'"')
-    return data
-
-
 def parse_faults(raw: list[dict] | None) -> list[Fault]:
     return [
         Fault(name=f["name"], p=float(f.get("p", 1.0)), params=dict(f.get("params") or {})) for f in raw or []

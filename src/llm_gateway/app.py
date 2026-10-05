@@ -1,11 +1,13 @@
 """OpenAI-compatible gateway.
 
-Requests to /v1/chat/completions are forwarded to one OpenAI-compatible upstream (Ollama by
-default). Streaming responses are relayed chunk by chunk. Every response produces one row
-of passive quality signals (see signals.py).
+POST /v1/chat/completions is authenticated by API key, routed to the provider that serves the
+requested model, and returned in OpenAI format (streaming or not). Every response produces one
+row of passive quality signals (signals.py) and one JSON access-log line.
 """
 
 import asyncio
+import json
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -16,9 +18,13 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from llm_gateway import signals as sig
-from llm_gateway.config import Settings
-from llm_gateway.faults import FaultInjector, parse_faults, restore_model_name
+from llm_gateway.config import Settings, hash_key
+from llm_gateway.faults import FaultInjector, parse_faults
+from llm_gateway.providers import ErrorKind, Provider, ProviderError, Registry, build_provider
+from llm_gateway.providers.openai_compat import OpenAICompatProvider
 from llm_gateway.signal_log import SignalLog
+
+log = logging.getLogger("llm_gateway.access")
 
 
 def openai_error(status: int, message: str, err_type: str, code: str | None = None) -> JSONResponse:
@@ -28,12 +34,13 @@ def openai_error(status: int, message: str, err_type: str, code: str | None = No
     )
 
 
-def build_client(settings: Settings) -> httpx.AsyncClient:
-    headers = {}
-    if settings.upstream_api_key:
-        headers["Authorization"] = f"Bearer {settings.upstream_api_key}"
-    timeout = httpx.Timeout(settings.read_timeout_s, connect=settings.connect_timeout_s)
-    return httpx.AsyncClient(base_url=settings.upstream_base_url, headers=headers, timeout=timeout)
+def provider_error_response(err: ProviderError, headers: dict | None = None) -> JSONResponse:
+    if err.kind is ErrorKind.BAD_REQUEST:
+        resp = openai_error(err.status, err.message, "invalid_request_error")
+    else:
+        resp = openai_error(err.status, err.message, "upstream_error", f"upstream_{err.kind.value}")
+    resp.headers.update(headers or {})
+    return resp
 
 
 def bearer_token(request: Request) -> str | None:
@@ -41,12 +48,32 @@ def bearer_token(request: Request) -> str | None:
     return auth[7:].strip() if auth.lower().startswith("bearer ") else None
 
 
-def create_app(settings: Settings | None = None, client: httpx.AsyncClient | None = None) -> FastAPI:
+def sse(data: dict | str) -> bytes:
+    return f"data: {data if isinstance(data, str) else json.dumps(data)}\n\n".encode()
+
+
+def create_app(
+    settings: Settings | None = None,
+    client: httpx.AsyncClient | None = None,
+    providers: list[Provider] | None = None,
+) -> FastAPI:
+    """`client` (tests) wraps a ready httpx client as the single provider; `providers` replaces config."""
     settings = settings or Settings.from_env()
+    tenants = settings.tenant_index()
+
+    def make_providers() -> list[Provider]:
+        if providers is not None:
+            return providers
+        if client is not None:
+            return [OpenAICompatProvider(settings.provider_name, "", client=client)]
+        return [
+            build_provider(c, settings.connect_timeout_s, settings.read_timeout_s)
+            for c in settings.provider_configs()
+        ]
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.client = client or build_client(settings)
+        app.state.registry = Registry(make_providers())
         app.state.signal_log = SignalLog(settings.signal_dir)
         app.state.signal_log.start()
         app.state.regenerates = sig.RegenerateTracker()
@@ -55,17 +82,9 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
             yield
         finally:
             await app.state.signal_log.stop()
-            await app.state.client.aclose()
+            await app.state.registry.aclose()
 
     app = FastAPI(title="LLM Gateway", lifespan=lifespan)
-
-    def tenant_for(request: Request) -> str:
-        return settings.keys.get(bearer_token(request) or "", "anonymous")
-
-    def record(request: Request, **kwargs) -> sig.ResponseSignals:
-        signals = sig.extract(provider=settings.provider_name, **kwargs)
-        request.app.state.signal_log.append(signals)
-        return signals
 
     def require_admin(key: str | None) -> None:
         if not settings.admin_key:
@@ -93,110 +112,133 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
         return {"status": "ok"}
 
     @app.get("/v1/models")
-    async def list_models(request: Request) -> Response:
-        try:
-            upstream = await request.app.state.client.get("/models")
-        except httpx.HTTPError as exc:
-            return upstream_unavailable(exc)
-        return Response(upstream.content, upstream.status_code, media_type="application/json")
+    async def list_models(request: Request) -> dict:
+        models = await request.app.state.registry.list_models()
+        return {
+            "object": "list",
+            "data": [{"id": m, "object": "model", "owned_by": "gateway"} for m in models],
+        }
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
+        token = bearer_token(request)
+        tenant = tenants.get(hash_key(token)) if token else None
+        if tenant is None and settings.require_auth:
+            return openai_error(401, "Missing or invalid API key.", "authentication_error", "invalid_api_key")
+        tenant = tenant or "anonymous"
+
         try:
             body = await request.json()
         except ValueError:
             return openai_error(400, "Request body must be JSON.", "invalid_request_error")
         if not isinstance(body, dict):
             return openai_error(400, "Request body must be a JSON object.", "invalid_request_error")
+        model = str(body.get("model") or "")
+        provider: Provider | None = request.app.state.registry.resolve(model)
+        if provider is None:
+            return openai_error(
+                404,
+                f"Model {model!r} is not served by this gateway.",
+                "invalid_request_error",
+                "model_not_found",
+            )
 
-        tenant = tenant_for(request)
+        request_id = uuid.uuid4().hex
+        headers = {"X-Request-Id": request_id}
+        applied = request.app.state.faults.apply(body)
         common = {
-            "request_id": uuid.uuid4().hex,
+            "request_id": request_id,
             "tenant": tenant,
             "body": body,
             "started": time.time(),
             "regenerate": request.app.state.regenerates.seen_recently(tenant, sig.prompt_hash(body)),
+            "truth_fault": applied.fault,
         }
 
-        applied = request.app.state.faults.apply(body)
-        common["truth_fault"] = applied.fault
-
-        http: httpx.AsyncClient = request.app.state.client
-        try:
-            upstream = await http.send(
-                http.build_request("POST", "/chat/completions", json=applied.body), stream=True
+        def record(status: int, first_token_at=None, message=None, finish_reason=None, usage=None) -> None:
+            signals = sig.extract(
+                provider=provider.name,
+                status_code=status,
+                finished=time.time(),
+                first_token_at=first_token_at,
+                message=message,
+                finish_reason=finish_reason,
+                usage=usage,
+                **common,
             )
-        except httpx.HTTPError as exc:
-            error = upstream_unavailable(exc)
-            record(request, **common, status_code=error.status_code, finished=time.time(),
-                   first_token_at=None, message=None, finish_reason=None, usage=None)  # fmt: skip
-            error.headers["X-Request-Id"] = common["request_id"]
-            return error
+            request.app.state.signal_log.append(signals)
+            log.info(
+                "request",
+                extra={
+                    "request_id": request_id,
+                    "tenant": tenant,
+                    "provider": provider.name,
+                    "model": model,
+                    "stream": signals.stream,
+                    "status": status,
+                    "latency_ms": round(signals.latency_s * 1000, 1),
+                    "prompt_tokens": signals.prompt_tokens,
+                    "completion_tokens": signals.completion_tokens,
+                    "finish_reason": finish_reason,
+                },
+            )
 
-        # Errors and non-streaming results are returned whole, with the upstream status code.
-        if not body.get("stream") or upstream.status_code != 200:
-            content = restore_model_name(await upstream.aread(), applied)
-            await upstream.aclose()
-            message, finish_reason, usage = None, None, None
-            if upstream.status_code == 200:
-                try:
-                    payload = upstream.json()
-                    choice = (payload.get("choices") or [{}])[0]
-                    message, finish_reason, usage = (
-                        choice.get("message"),
-                        choice.get("finish_reason"),
-                        payload.get("usage"),
-                    )
-                except ValueError:
-                    pass
-            if applied.chunk_delay_s and usage:
+        if not body.get("stream"):
+            try:
+                result = await provider.complete(applied.body)
+            except ProviderError as err:
+                record(err.status)
+                return provider_error_response(err, headers)
+            result["model"] = model  # a substituted model stays invisible to the client
+            choice = (result.get("choices") or [{}])[0]
+            usage = result.get("usage") or {}
+            if applied.chunk_delay_s:
                 await asyncio.sleep(applied.chunk_delay_s * (usage.get("completion_tokens") or 0) / 10)
-            finished = time.time()
-            record(request, **common, status_code=upstream.status_code, finished=finished,
-                   first_token_at=None, message=message, finish_reason=finish_reason, usage=usage)  # fmt: skip
-            media_type = upstream.headers.get("content-type", "application/json")
-            return Response(
-                content,
-                upstream.status_code,
-                media_type=media_type,
-                headers={"X-Request-Id": common["request_id"]},
-            )
+            record(200, None, choice.get("message"), choice.get("finish_reason"), usage)
+            return JSONResponse(result, headers=headers)
+
+        # Streaming: fetch the first chunk before answering, so an upstream error that happens
+        # before any token is returned as a proper HTTP error (and can trigger failover).
+        chunks = provider.stream(applied.body)
+        try:
+            first = await anext(chunks)
+        except StopAsyncIteration:
+            first = None
+        except ProviderError as err:
+            record(err.status)
+            return provider_error_response(err, headers)
 
         async def relay() -> AsyncIterator[bytes]:
             acc = sig.StreamAccumulator()
-            first_token_at = None
+            first_token_at = time.time()
+            pending = [first] if first is not None else []
             try:
-                async for chunk in upstream.aiter_bytes():
-                    if first_token_at is None:
-                        first_token_at = time.time()
-                    acc.feed(chunk)
+                while pending:
+                    chunk = pending.pop()
+                    chunk["model"] = model
+                    acc.add(chunk)
                     if applied.chunk_delay_s:
                         await asyncio.sleep(applied.chunk_delay_s)
-                    yield restore_model_name(chunk, applied)
+                    yield sse(chunk)
+                    try:
+                        pending.append(await anext(chunks))
+                    except StopAsyncIteration:
+                        pass
+                yield sse("[DONE]")
+            except ProviderError as err:  # mid-stream: too late to fail over; tell the client in-band
+                error = {
+                    "message": err.message,
+                    "type": "upstream_error",
+                    "code": f"upstream_{err.kind.value}",
+                }
+                yield sse({"error": error})
             finally:
-                await upstream.aclose()
-                record(request, **common, status_code=200, finished=time.time(), first_token_at=first_token_at,
-                       message=acc.message(), finish_reason=acc.finish_reason, usage=acc.usage)  # fmt: skip
+                record(200, first_token_at, acc.message(), acc.finish_reason, acc.usage)
 
         return StreamingResponse(
             relay(),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                "X-Request-Id": common["request_id"],
-            },
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"} | headers,
         )
 
     return app
-
-
-def upstream_unavailable(exc: httpx.HTTPError) -> JSONResponse:
-    if isinstance(exc, httpx.TimeoutException):
-        return openai_error(504, "Upstream provider timed out.", "upstream_error", "upstream_timeout")
-    return openai_error(
-        502,
-        f"Upstream provider unavailable: {exc.__class__.__name__}.",
-        "upstream_error",
-        "upstream_unavailable",
-    )
