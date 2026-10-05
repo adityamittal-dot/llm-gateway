@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from opentelemetry import trace
 from redis.asyncio import from_url as redis_from_url
 
 from llm_gateway import signals as sig
@@ -39,6 +40,7 @@ from llm_gateway.providers.openai_compat import OpenAICompatProvider
 from llm_gateway.ratelimit import Limiter, MemoryLimitStore, RedisLimitStore, estimate_tokens
 from llm_gateway.retries import Retrier, RetryPolicy
 from llm_gateway.signal_log import SignalLog
+from llm_gateway.telemetry import get_metrics, prometheus_payload, tracer
 
 log = logging.getLogger("llm_gateway.access")
 
@@ -98,6 +100,7 @@ def create_app(
         limit_store = RedisLimitStore(app.state.redis) if app.state.redis is not None else MemoryLimitStore()
         app.state.limiter = Limiter(limit_store, settings.tenants, settings.teams, settings.orgs)
         app.state.pricing = Pricing.from_config(settings.prices)
+        app.state.metrics = get_metrics()
         cache_cfg = CacheConfig.from_config(settings.cache)
         app.state.embedder = embedder or Embedder(cache_cfg.embedding_base_url, cache_cfg.embedding_model)
         cache_store = RedisCacheStore(app.state.redis) if app.state.redis is not None else MemoryCacheStore()
@@ -159,6 +162,11 @@ def create_app(
         require_admin(x_admin_key)
         return await request.app.state.breaker.snapshot(list(request.app.state.registry.providers))
 
+    @app.get("/metrics")
+    async def metrics_endpoint() -> Response:
+        payload, content_type = prometheus_payload()
+        return Response(payload, media_type=content_type)
+
     @app.get("/healthz")
     async def healthz() -> dict:
         return {"status": "ok"}
@@ -182,6 +190,11 @@ def create_app(
                    "stream": bool(body.get("stream")), "status": 200, "cache": hit.kind,
                    "similarity": round(hit.similarity, 4), "saved_usd": round(saved, 8)},
         )  # fmt: skip
+        request.app.state.metrics.request(tenant=tenant, provider="cache", model=model, status=200,
+                                          cache=f"hit-{hit.kind}", latency_s=0.0, ttft_s=None, prompt_tokens=None,
+                                          completion_tokens=None, cost_usd=0.0, failovers=0)  # fmt: skip
+        if saved:
+            request.app.state.metrics.saved.add(saved, {"tenant": tenant})
         if request.app.state.ledger is not None:
             usage = response.get("usage") or {}
             request.app.state.ledger.append(
@@ -206,6 +219,17 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
+        request.state.spans = []
+        try:
+            return await handle_chat(request)
+        except BaseException as exc:  # end any span left open by an unexpected error (e.g. Redis down)
+            for open_span in request.state.spans:
+                if open_span.is_recording():
+                    open_span.record_exception(exc)
+                    open_span.end()
+            raise
+
+    async def handle_chat(request: Request) -> Response:
         token = bearer_token(request)
         tenant = tenants.get(hash_key(token)) if token else None
         if tenant is None and settings.require_auth:
@@ -236,11 +260,13 @@ def create_app(
 
         limiter: Limiter = request.app.state.limiter
         if scope := await limiter.over_budget(tenant):
+            request.app.state.metrics.rate_limited.add(1, {"tenant": tenant, "reason": "budget"})
             return openai_error(
                 429, f"Monthly budget exhausted for {scope}.", "budget_exceeded", "budget_exceeded"
             )
         reservation, wait_ms = await limiter.reserve(tenant, estimate_tokens(body))
         if reservation is None:
+            request.app.state.metrics.rate_limited.add(1, {"tenant": tenant, "reason": "rate"})
             if wait_ms < 0:
                 return openai_error(429, "Request is larger than the token-per-minute limit.", "rate_limit_exceeded",
                                     "request_too_large")  # fmt: skip
@@ -252,6 +278,10 @@ def create_app(
         headers = {"X-Request-Id": request_id}
         if cache_mode != "off":
             headers["X-Cache"] = "miss"
+        span = tracer.start_span(f"chat {model}", attributes={
+            "gen_ai.operation.name": "chat", "gen_ai.request.model": model, "llm_gateway.tenant": tenant,
+            "llm_gateway.request_id": request_id, "llm_gateway.stream": bool(body.get("stream"))})  # fmt: skip
+        request.state.spans.append(span)
         common = {
             "request_id": request_id,
             "tenant": tenant,
@@ -310,6 +340,20 @@ def create_app(
                                 "repetition": round(signals.repetition, 4), "tool_calls": signals.tool_calls,
                                 "tool_call_valid": signals.tool_call_valid},
                 })  # fmt: skip
+            request.app.state.metrics.request(
+                tenant=tenant, provider=provider.name, model=model, status=status,
+                cache="miss" if cache_mode != "off" else "off", latency_s=signals.latency_s, ttft_s=signals.ttft_s,
+                prompt_tokens=signals.prompt_tokens, completion_tokens=signals.completion_tokens, cost_usd=cost,
+                failovers=max(0, len(attempts) - 1),
+            )  # fmt: skip
+            span.set_attributes({"gen_ai.system": provider.name, "gen_ai.response.model": target,
+                                 "gen_ai.usage.input_tokens": signals.prompt_tokens or 0,
+                                 "gen_ai.usage.output_tokens": signals.completion_tokens or 0,
+                                 "http.response.status_code": status, "llm_gateway.cost_usd": cost,
+                                 "llm_gateway.failovers": max(0, len(attempts) - 1)})  # fmt: skip
+            if finish_reason:
+                span.set_attribute("gen_ai.response.finish_reasons", [finish_reason])
+            span.end()
             for scope, spent, soft in await limiter.add_spend(tenant, cost):
                 log.warning("soft_budget_exceeded", extra={"scope": scope, "spent_usd": round(spent, 6),
                                                            "soft_budget_usd": soft})  # fmt: skip
@@ -354,21 +398,31 @@ def create_app(
                 attempts.append({"provider": provider.name, "outcome": "breaker_open"})
                 continue
             applied = request.app.state.faults.apply({**body, "model": target})
+            attempt_ctx = trace.set_span_in_context(span)
             try:
-                if body.get("stream"):
-                    opened = await retrier.call(
-                        provider.name,
-                        lambda p=provider, b=applied.body: open_stream(p, b),
-                        on_retry_for(provider),
+                with tracer.start_as_current_span(
+                    f"provider {provider.name}", context=attempt_ctx
+                ) as attempt_span:
+                    attempt_span.set_attributes(
+                        {"gen_ai.system": provider.name, "gen_ai.request.model": target}
                     )
-                else:
-                    result = await retrier.call(
-                        provider.name,
-                        lambda p=provider, b=applied.body: p.complete(b),
-                        on_retry_for(provider),
-                    )
+                    if body.get("stream"):
+                        opened = await retrier.call(
+                            provider.name,
+                            lambda p=provider, b=applied.body: open_stream(p, b),
+                            on_retry_for(provider),
+                        )
+                    else:
+                        result = await retrier.call(
+                            provider.name,
+                            lambda p=provider, b=applied.body: p.complete(b),
+                            on_retry_for(provider),
+                        )
             except ProviderError as err:
                 await breaker.record(provider.name, err.kind)
+                request.app.state.metrics.breaker_states[provider.name] = int(
+                    await breaker.state(provider.name) == "open"
+                )
                 attempts.append({"provider": provider.name, "outcome": err.kind.value})
                 last_error = err
                 if err.kind is ErrorKind.BAD_REQUEST:
@@ -377,6 +431,7 @@ def create_app(
                                                "error_kind": err.kind.value})  # fmt: skip
                 continue
             await breaker.record(provider.name, None)
+            request.app.state.metrics.breaker_states[provider.name] = 0
             attempts.append({"provider": provider.name, "outcome": "ok"})
             break
         else:
