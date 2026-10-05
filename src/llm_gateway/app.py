@@ -21,6 +21,15 @@ from redis.asyncio import from_url as redis_from_url
 
 from llm_gateway import signals as sig
 from llm_gateway.breaker import BreakerConfig, CircuitBreaker, MemoryStore, RedisStore
+from llm_gateway.cache import (
+    CacheConfig,
+    Embedder,
+    MemoryCacheStore,
+    RedisCacheStore,
+    ResponseCache,
+    completion_from_stream,
+    replay_as_chunks,
+)
 from llm_gateway.config import Settings, hash_key
 from llm_gateway.db import LedgerWriter, ensure_partitions, load_prices, make_engine
 from llm_gateway.faults import FaultInjector, parse_faults
@@ -64,6 +73,7 @@ def create_app(
     client: httpx.AsyncClient | None = None,
     providers: list[Provider] | None = None,
     redis_client=None,
+    embedder: Embedder | None = None,
 ) -> FastAPI:
     """`client` (tests) wraps a ready httpx client as the single provider; `providers` replaces config."""
     settings = settings or Settings.from_env()
@@ -88,6 +98,10 @@ def create_app(
         limit_store = RedisLimitStore(app.state.redis) if app.state.redis is not None else MemoryLimitStore()
         app.state.limiter = Limiter(limit_store, settings.tenants, settings.teams, settings.orgs)
         app.state.pricing = Pricing.from_config(settings.prices)
+        cache_cfg = CacheConfig.from_config(settings.cache)
+        app.state.embedder = embedder or Embedder(cache_cfg.embedding_base_url, cache_cfg.embedding_model)
+        cache_store = RedisCacheStore(app.state.redis) if app.state.redis is not None else MemoryCacheStore()
+        app.state.cache = ResponseCache(cache_store, cache_cfg, app.state.embedder)
         app.state.ledger = app.state.engine = None
         if settings.database_url:
             try:
@@ -112,6 +126,8 @@ def create_app(
                 await app.state.engine.dispose()
             await app.state.signal_log.stop()
             await app.state.registry.aclose()
+            if embedder is None:
+                await app.state.embedder.aclose()
             if app.state.redis is not None and redis_client is None:
                 await app.state.redis.aclose()
 
@@ -155,6 +171,39 @@ def create_app(
             "data": [{"id": m, "object": "model", "owned_by": "gateway"} for m in models],
         }
 
+    async def serve_cache_hit(request: Request, hit, tenant: str, model: str, body: dict) -> Response:
+        request_id = uuid.uuid4().hex
+        headers = {"X-Request-Id": request_id, "X-Cache": f"hit-{hit.kind}", "X-Gateway-Provider": "cache"}
+        response = hit.response | {"model": model}
+        saved = request.app.state.pricing.cost(model, response.get("usage"))
+        log.info(
+            "request",
+            extra={"request_id": request_id, "tenant": tenant, "provider": "cache", "model": model,
+                   "stream": bool(body.get("stream")), "status": 200, "cache": hit.kind,
+                   "similarity": round(hit.similarity, 4), "saved_usd": round(saved, 8)},
+        )  # fmt: skip
+        if request.app.state.ledger is not None:
+            usage = response.get("usage") or {}
+            request.app.state.ledger.append(
+                {"ts": dt.datetime.now(dt.UTC), "request_id": request_id, "tenant": tenant,
+                 "session_id": request.headers.get("x-session-id"), "provider": "cache", "model": model,
+                 "status": 200, "stream": bool(body.get("stream")), "prompt_tokens": usage.get("prompt_tokens"),
+                 "completion_tokens": usage.get("completion_tokens"), "cost_usd": 0.0, "latency_ms": 0,
+                 "cache_status": f"hit-{hit.kind}", "failovers": 0,
+                 "finish_reason": response["choices"][0].get("finish_reason"), "quality": {"saved_usd": saved}}
+            )  # fmt: skip
+        if not body.get("stream"):
+            return JSONResponse(response, headers=headers)
+
+        async def replay() -> AsyncIterator[bytes]:
+            for chunk in replay_as_chunks(response):
+                yield sse(chunk)
+            yield sse("[DONE]")
+
+        return StreamingResponse(
+            replay(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"} | headers
+        )
+
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
         token = bearer_token(request)
@@ -179,6 +228,12 @@ def create_app(
                 "model_not_found",
             )
 
+        # Cache before limits: a hit costs no provider tokens, so it is not rate limited or charged.
+        cache: ResponseCache = request.app.state.cache
+        cache_mode = cache.mode(request.headers.get("x-cache"), body)
+        if hit := await cache.lookup(tenant, body, cache_mode):
+            return await serve_cache_hit(request, hit, tenant, model, body)
+
         limiter: Limiter = request.app.state.limiter
         if scope := await limiter.over_budget(tenant):
             return openai_error(
@@ -195,6 +250,8 @@ def create_app(
 
         request_id = uuid.uuid4().hex
         headers = {"X-Request-Id": request_id}
+        if cache_mode != "off":
+            headers["X-Cache"] = "miss"
         common = {
             "request_id": request_id,
             "tenant": tenant,
@@ -246,7 +303,7 @@ def create_app(
                     "cost_usd": cost,
                     "latency_ms": int(signals.latency_s * 1000),
                     "ttft_ms": int(signals.ttft_s * 1000) if signals.ttft_s is not None else None,
-                    "cache_status": None,
+                    "cache_status": "miss" if cache_mode != "off" else None,
                     "failovers": max(0, len(attempts) - 1),
                     "finish_reason": finish_reason,
                     "quality": {"refusal": signals.refusal, "empty": signals.empty,
@@ -345,6 +402,8 @@ def create_app(
             await record(
                 provider, applied, 200, None, choice.get("message"), choice.get("finish_reason"), usage
             )
+            if choice.get("finish_reason") in ("stop", "length", "tool_calls"):
+                await cache.store_response(tenant, body, cache_mode, result)
             return JSONResponse(result, headers=headers)
 
         chunks, first = opened
@@ -366,6 +425,9 @@ def create_app(
                     except StopAsyncIteration:
                         pass
                 yield sse("[DONE]")
+                if acc.finish_reason in ("stop", "length", "tool_calls"):
+                    done = completion_from_stream(model, acc.message(), acc.finish_reason, acc.usage)
+                    await cache.store_response(tenant, body, cache_mode, done)
             except ProviderError as err:  # mid-stream: too late to fail over; tell the client in-band
                 await breaker.record(provider.name, err.kind)
                 error = {
