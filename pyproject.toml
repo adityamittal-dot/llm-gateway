@@ -9,6 +9,8 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.142.2",
     "httpx>=0.28.1",
+    "pyarrow>=25.0.1",
+    "pyyaml>=6.0.3",
     "uvicorn[standard]>=0.54.0",
 ]
 
@@ -23,6 +25,7 @@ build-backend = "uv_build"
 dev = [
     "anyio>=4.15.1",
     "openai>=3.24.0",
+    "pandas>=3.0.6",
     "pytest>=9.1.1",
     "ruff>=0.16.10",
 ]
