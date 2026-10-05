@@ -130,6 +130,7 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
             error = upstream_unavailable(exc)
             record(request, **common, status_code=error.status_code, finished=time.time(),
                    first_token_at=None, message=None, finish_reason=None, usage=None)  # fmt: skip
+            error.headers["X-Request-Id"] = common["request_id"]
             return error
 
         # Errors and non-streaming results are returned whole, with the upstream status code.
@@ -154,7 +155,12 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
             record(request, **common, status_code=upstream.status_code, finished=finished,
                    first_token_at=None, message=message, finish_reason=finish_reason, usage=usage)  # fmt: skip
             media_type = upstream.headers.get("content-type", "application/json")
-            return Response(content, upstream.status_code, media_type=media_type)
+            return Response(
+                content,
+                upstream.status_code,
+                media_type=media_type,
+                headers={"X-Request-Id": common["request_id"]},
+            )
 
         async def relay() -> AsyncIterator[bytes]:
             acc = sig.StreamAccumulator()
@@ -175,7 +181,11 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
         return StreamingResponse(
             relay(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "X-Request-Id": common["request_id"],
+            },
         )
 
     return app
