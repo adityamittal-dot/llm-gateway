@@ -14,7 +14,6 @@ Every team adding an LLM feature eventually hits the same problems:
 - **Vendor lock-in / outage risk.** A single provider dependency means a single point of failure.
 - **No caching for non-deterministic responses.** Exact-match caching barely works for natural language; most teams cache nothing and re-pay for near-identical prompts.
 - **No per-tenant limits.** One noisy client — or one agent stuck in a loop — can starve everyone else or blow the budget alone.
-
 - **Silent degradation.** Providers ship quantization, kernel, routing and sampling changes without a version bump. Responses still return `200 OK`, so uptime checks and HTTP-error circuit breakers see nothing while answer quality, tool-call validity or refusal rates move.
 
 This project solves these by building the gateway layer that should sit between any app and any LLM provider.
@@ -50,7 +49,7 @@ ECS Fargate (N tasks): Uvicorn -> FastAPI (async, SSE streaming)
   |     +-- HIT  -> return cached response
   |     +-- MISS -> Router
   |
-  +-- Router (fallback chains, cost/latency rules, complexity routing)
+  +-- Router (fallback chains, cost/latency rules)
   |     |
   |     +-- Circuit breaker (HTTP errors + quality signals, state shared in Redis)
   |           |
@@ -103,9 +102,9 @@ Postgres is the system of record; Redis only holds hot, rebuildable state (rate-
 | `orgs`, `teams` | Tenant hierarchy |
 | `api_keys` | Hashed key, owner (org/team), allowed models, rate limits, status |
 | `budgets` | Soft/hard spend limits per org, team, key or session; period and reset rules |
-| `routing_rules` | Fallback chains, model aliases, complexity-routing and shadow-traffic config |
+| `routing_rules` | Fallback chains, model aliases, shadow-traffic and quality-breaker config |
 | `model_prices` | Versioned price per model/region (input, output, cached tokens), effective-from date |
-| `usage_ledger` | One row per request: tenant, key, session, model, provider, tokens, cost, latency, cache status, failover flag. **Partitioned by month** so old data can be detached and archived to S3 cheaply |
+| `usage_ledger` | One row per request: tenant, key, session, model, provider, tokens, cost, latency, cache status, failover flag, quality signals (finish reason, tool-call validity, refusal). **Partitioned by month** so old data can be detached and archived to S3 cheaply |
 
 Design rules:
 - The ledger is append-only; budgets are checked against Redis counters on the hot path and reconciled from the ledger.
