@@ -68,6 +68,7 @@ class FakeProvider:
 
 
 def gateway(*providers, **settings):
+    settings.setdefault("retry", {"base_delay_s": 0.0})
     return TestClient(create_app(Settings(**settings), providers=list(providers)))
 
 

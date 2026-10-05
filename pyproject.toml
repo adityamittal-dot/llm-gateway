@@ -28,11 +28,13 @@ build-backend = "uv_build"
 dev = [
     "anyio>=4.15.1",
     "fakeredis>=2.39.0",
+    "matplotlib>=3.11.2",
     "openai>=3.24.0",
     "pandas>=3.0.6",
     "pgserver>=0.1.4",
     "pytest>=9.1.1",
     "ruff>=0.16.10",
+    "tabulate>=0.10.0",
 ]
 
 [tool.ruff]

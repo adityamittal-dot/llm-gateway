@@ -52,6 +52,8 @@ class Settings:
     # Enables /admin endpoints when set (sent as the X-Admin-Key header).
     admin_key: str | None = None
     log_level: str = "INFO"
+    # Retry policy overrides (retries.RetryPolicy fields).
+    retry: dict = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -71,6 +73,7 @@ class Settings:
             faults=list(file_cfg.get("faults") or []),
             admin_key=os.environ.get("ADMIN_KEY") or file_cfg.get("admin_key"),
             log_level=os.environ.get("LOG_LEVEL", file_cfg.get("log_level", cls.log_level)),
+            retry=dict(file_cfg.get("retry") or {}),
         )
 
     def provider_configs(self) -> list[dict]:

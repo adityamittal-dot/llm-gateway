@@ -6,7 +6,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 RUN=data/devstack && mkdir -p "$RUN"
 pids=()
-cleanup() { kill "${pids[@]}" 2>/dev/null || true; wait 2>/dev/null || true; }
+cleanup() {
+  trap - EXIT INT TERM
+  pkill -P $$ 2>/dev/null || true  # direct children, including `uv run` wrappers
+  kill "${pids[@]}" 2>/dev/null || true
+  pkill -f "postgres -D $PWD/$RUN/pg" 2>/dev/null || true
+  wait 2>/dev/null || true
+}
 trap cleanup EXIT INT TERM
 
 redis_bin="$(command -v valkey-server || command -v redis-server)"
@@ -38,4 +44,7 @@ export REDIS_URL=redis://127.0.0.1:6379/0 GATEWAY_CONFIG=config/dev.yaml
 echo "redis: $REDIS_URL"
 echo "postgres: $DATABASE_URL"
 echo "gateway: http://127.0.0.1:8000  (key sk-dev-local, model mock-small)"
-uv run llm-gateway
+# Run in the background and wait, so Ctrl-C/SIGTERM reach the trap immediately.
+uv run llm-gateway &
+pids+=($!)
+wait

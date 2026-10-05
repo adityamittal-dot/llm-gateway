@@ -22,7 +22,11 @@ SSE_CHUNKS = [
 
 def make_gateway(handler) -> TestClient:
     upstream = httpx.AsyncClient(base_url="http://upstream/v1", transport=httpx.MockTransport(handler))
-    return TestClient(create_app(Settings(upstream_base_url="http://upstream/v1"), client=upstream))
+    return TestClient(
+        create_app(
+            Settings(upstream_base_url="http://upstream/v1", retry={"base_delay_s": 0}), client=upstream
+        )
+    )
 
 
 def test_non_streaming_completion_is_forwarded_unchanged():
