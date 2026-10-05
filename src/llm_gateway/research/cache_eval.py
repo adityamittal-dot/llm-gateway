@@ -44,7 +44,7 @@ def sweep(sims: np.ndarray, labels: np.ndarray, thresholds: np.ndarray) -> pd.Da
 
 async def main_async(args) -> None:
     pairs = load_pairs(args.pairs)
-    embedder = Embedder(args.base_url, args.model)
+    embedder = Embedder(args.base_url, args.model, timeout_s=300)
     try:
         a = await embedder.embed(list(pairs.sentence1))
         b = await embedder.embed(list(pairs.sentence2))

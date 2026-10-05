@@ -135,9 +135,11 @@ class RedisCacheStore:
 class Embedder:
     """OpenAI-compatible /embeddings client (Ollama with nomic-embed-text by default)."""
 
-    def __init__(self, base_url: str, model: str, client: httpx.AsyncClient | None = None):
+    def __init__(
+        self, base_url: str, model: str, client: httpx.AsyncClient | None = None, timeout_s: float = 10.0
+    ):
         self.model = model
-        self.client = client or httpx.AsyncClient(base_url=base_url, timeout=10)
+        self.client = client or httpx.AsyncClient(base_url=base_url, timeout=timeout_s)
 
     async def embed(self, texts: list[str]) -> np.ndarray:
         resp = await self.client.post("/embeddings", json={"model": self.model, "input": texts})
