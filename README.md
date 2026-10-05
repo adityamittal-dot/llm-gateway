@@ -150,6 +150,14 @@ Design rules:
 
 ### 5. Gateway overhead
 - The gateway's own p50/p99 latency (excluding the provider, cache off) is measured with k6 and published in this README. It is the first number anyone evaluating a gateway asks for.
+- **Measured** (`scripts/overhead.py`: k6 against an instant mock LLM directly vs through the gateway; one uvicorn worker on a laptop CPU, auth + routing + limits + metrics on, 30 s per run):
+
+  | load | p50 overhead | p90 | p99 | gateway throughput |
+  |---|---|---|---|---|
+  | 1 concurrent client | **1.3 ms** | 1.7 ms | 2.1 ms | 579 req/s |
+  | 10 concurrent clients | 15.4 ms | 37.1 ms | 71.6 ms | 473 req/s (CPU-bound single worker; the extra is queueing) |
+
+  Per-request cost is ~1–2 ms; under load one Python worker saturates near 500 req/s, so capacity comes from more workers/tasks (results in `results/overhead_*.json`).
 
 ### 6. Quality circuit breaker (the differentiator)
 - **Passive signals only, no extra model calls.** Every response already carries cheap quality proxies:
