@@ -419,3 +419,5 @@ Status legend: ✅ done · 🟡 partly done · ⬜ not started. Details per day 
 ## Request path (end to end)
 
 Client -> ALB -> Fargate (FastAPI) -> API-key auth -> token-aware rate limit and budget check (Redis) -> exact then semantic cache (Redis) -> hit: return cached response / miss: router -> circuit breaker -> provider adapter (Bedrock, Anthropic, OpenAI, ...) with fallback -> streamed response -> quality signals feed the quality breaker -> usage event to the ledger, with OpenTelemetry tracing every hop and Sentry capturing exceptions and failover events.
+
+_Last updated: 2026-10-10._
